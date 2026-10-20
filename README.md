@@ -245,6 +245,17 @@ uv run python eval/eval_rag_retrieval.py
 
 结果写入 `eval/rag_retrieval_results.json`（当前结果：42 条事实 recall@1=100%、30 条事件 recall@5=86.7%、MRR=0.78）。
 
+## 产品评审报告（两轮，可复现）
+
+产品侧用自研的 AI 产品验收框架（5 大维度、19 条准则、每维 1–5 分、满分 25、阻断项一票否决）对本项目做了两轮**自动评审**（评审人是框架本身，不是人工评审），报告随仓库提供：
+
+| 版本 | 得分 | 主要变化 |
+|---|---|---|
+| `eval/evaluation_report.md`（v1.0） | **13.5 / 25** | 列出 3 项阻断：B1 无显式反馈入口 / B2 无 Bad Case 管理 / B3 无埋点方案 |
+| `eval/evaluation_report_v2.md`（v2.0） | **16.0 / 25（+2.5）** | B1、B2 已解决，B3 降级为条件；新增 **44 条边缘用例并全部通过**；30 章成本核算 **\$12.30 → \$7.04（-43%）** |
+
+评审框架本身（5 大维度 / 19 条准则 / 25 分制）开源在 [ai-product-evaluation](https://github.com/HuangLeijiana/ai-product-evaluation)。
+
 ## FAQ
 
 **Q: Can I really write a complete novel for free?**
