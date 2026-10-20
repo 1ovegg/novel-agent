@@ -21,10 +21,12 @@ from ..config.settings import PROVIDER_PRESETS
 logger = logging.getLogger(__name__)
 
 # ========================================================================
-# Provider pricing (USD per 1M tokens, as of 2026-07)
+# Provider pricing (per 1M tokens, in each provider's NATIVE currency, as of 2026-07)
 # ========================================================================
 
 # Format: {model_id: (input_price_per_1M, output_price_per_1M)}
+# 币种见 PROVIDER_CURRENCY：Anthropic / OpenAI / OpenRouter 官方价目表为 USD，
+# DashScope（通义千问）/ ModelScope 官方价目表为 CNY。
 # Prices are estimates — always check the provider's official pricing page.
 PROVIDER_PRICING = {
     "anthropic": {
@@ -56,7 +58,8 @@ PROVIDER_PRICING = {
         "Qwen/Qwen3-8B": (0.0, 0.0),
     },
     "dashscope": {
-        # Alibaba DashScope (Qwen official API)
+        # Alibaba DashScope (Qwen 官方 API) —— 官方价目表以人民币（CNY）计价
+        # ⚠️ 以下数值为量级估算，qwen-max/plus/turbo 档位差异较大，请以官方价格页为准
         "qwen-max": (2.00, 6.00),
         "qwen-plus": (1.00, 2.00),
         "qwen-turbo": (0.15, 0.60),
@@ -69,6 +72,43 @@ PROVIDER_PRICING = {
 
 # Fallback pricing when a specific model isn't found
 FALLBACK_PRICE = (1.0, 5.0)  # conservative estimate
+
+# ========================================================================
+# Currency handling
+# ========================================================================
+# 各 provider 官方价目表的计价币种（上面的 PROVIDER_PRICING 按原生币种记录）
+PROVIDER_CURRENCY: dict[str, str] = {
+    "anthropic": "USD",
+    "openai": "USD",
+    "openrouter": "USD",
+    "modelscope": "CNY",  # 阿里 ModelScope 魔搭，人民币计价（beta 期多为免费额度）
+    "dashscope": "CNY",   # 阿里云百炼 / 通义千问，人民币计价
+    "ollama": "USD",      # 本地推理免费，币种无意义
+}
+
+DEFAULT_CURRENCY = "USD"
+# 注意：人民币用全角「￥」(U+FFE5) 而不是半角「¥」(U+00A5)——
+# 后者在中文 Windows 控制台（GBK/cp936）里无法编码，print 时会抛 UnicodeEncodeError。
+CURRENCY_SYMBOLS = {"USD": "$", "CNY": "￥"}
+
+# 仅用于展示时折算（不是结算汇率，请按需覆盖）
+USD_TO_CNY = 7.2
+
+
+def currency_symbol(currency: str) -> str:
+    """Return the display symbol for a currency code ('USD' -> '$')."""
+    return CURRENCY_SYMBOLS.get(currency, "")
+
+
+def convert_amount(amount: float, frm: str, to: str, usd_to_cny: float = USD_TO_CNY) -> float:
+    """在 USD / CNY 之间折算金额（仅用于展示对比，不用于结算）。"""
+    if not frm or not to or frm == to:
+        return amount
+    if frm == "USD" and to == "CNY":
+        return amount * usd_to_cny
+    if frm == "CNY" and to == "USD":
+        return amount / usd_to_cny
+    return amount
 
 # ========================================================================
 # Per-agent token estimates (provider-agnostic)
@@ -160,8 +200,29 @@ class NovelCostEstimate:
     initial_write_total: float = 0.0
     with_one_revision_total: float = 0.0
     with_two_revisions_total: float = 0.0
+    # 金额的原生币种（由 provider 决定：Anthropic/OpenAI=USD，DashScope/ModelScope=CNY）
+    currency: str = DEFAULT_CURRENCY
 
-    def format(self) -> str:
+    def format(
+        self,
+        display_currency: str | None = None,
+        usd_to_cny: float = USD_TO_CNY,
+    ) -> str:
+        """Render the estimate.
+
+        Args:
+            display_currency: 想用哪种币种展示（"USD"/"CNY"）。默认用 provider 原生币种。
+            usd_to_cny: 展示折算用的汇率（不是结算汇率）。
+        """
+        native = self.currency or DEFAULT_CURRENCY
+        target = display_currency or native
+        sym = currency_symbol(target)
+        base = convert_amount(self.initial_write_total, native, target, usd_to_cny)
+        one_rev = convert_amount(self.with_one_revision_total, native, target, usd_to_cny)
+        two_rev = convert_amount(self.with_two_revisions_total, native, target, usd_to_cny)
+        currency_line = f"  Currency:        {target} ({native} 原生)"
+        if target != native:
+            currency_line += f"，按 1 USD = {usd_to_cny} CNY 折算"
         lines = [
             "=" * 60,
             "  Novel Writing Cost Estimate",
@@ -170,11 +231,12 @@ class NovelCostEstimate:
             f"  Provider:        {self.provider}",
             f"  Quality model:   {self.quality_model}",
             f"  Budget model:    {self.budget_model}",
+            currency_line,
             "",
             "  [Scenarios]",
-            f"  All pass 1st attempt:    ${self.initial_write_total:.2f}",
-            f"  30% need 1 revision:     ${self.with_one_revision_total:.2f}",
-            f"  15% need 2 revisions:    ${self.with_two_revisions_total:.2f}",
+            f"  All pass 1st attempt:    {sym}{base:.2f}",
+            f"  30% need 1 revision:     {sym}{one_rev:.2f}",
+            f"  15% need 2 revisions:    {sym}{two_rev:.2f}",
             "",
             "  [Tokens]",
             f"  Total input:   {self.total_input_tokens:,}",
@@ -242,6 +304,7 @@ class CostCalculator:
             provider=self.provider,
             quality_model=self.quality_model,
             budget_model=self.budget_model,
+            currency=PROVIDER_CURRENCY.get(self.provider, DEFAULT_CURRENCY),
         )
 
         for ch in range(1, total_chapters + 1):
@@ -348,17 +411,26 @@ def estimate_novel_cost(
 
 
 def print_cost_comparison(total_chapters: int = 30):
-    """Print a comparison of all supported providers."""
+    """Print a comparison of all supported providers (native currency + USD equivalent)."""
     calc = CostCalculator()
     estimates = calc.compare_providers(total_chapters)
-    print(f"\n{'=' * 70}")
+    print(f"\n{'=' * 86}")
     print(f"  Cost Comparison: {total_chapters} chapters ({calc.words_per_chapter} words/ch)")
-    print(f"{'=' * 70}")
-    print(f"  {'Provider':<20} {'Quality Model':<32} {'Base':>10} {'+Rev':>10}")
-    print(f"  {'-' * 65}")
+    print(f"{'=' * 86}")
+    print(f"  {'Provider':<14} {'Quality Model':<30} {'Cur':<4} {'Base':>10} {'+Rev':>10} {'≈Base(USD)':>11}")
+    print(f"  {'-' * 82}")
     for name, est in estimates.items():
+        native = est.currency or DEFAULT_CURRENCY
+        sym = currency_symbol(native)
+        usd = convert_amount(est.initial_write_total, native, "USD")
         print(
-            f"  {name:<20} {est.quality_model:<32} ${est.initial_write_total:>8.2f} ${est.with_one_revision_total:>8.2f}"
+            f"  {name:<14} {est.quality_model:<30} {native:<4} "
+            f"{sym + format(est.initial_write_total, '.2f'):>10} "
+            f"{sym + format(est.with_one_revision_total, '.2f'):>10} "
+            f"{'$' + format(usd, '.2f'):>11}"
         )
-    print(f"  {'ollama (local)':<20} {'any (free)':<32} {'$0.00':>10} {'$0.00':>10}")
-    print(f"{'=' * 70}\n")
+    print(f"  {'ollama (local)':<14} {'any (free)':<30} {'USD':<4} {'$0.00':>10} {'$0.00':>10} {'$0.00':>11}")
+    print(f"  {'-' * 82}")
+    print(f"  [注意] 约合 USD 按 1 USD = {USD_TO_CNY} CNY 折算，仅用于跨 provider 横向比较")
+    print(f"  [注意] 各 provider 按原生币种记录（Anthropic/OpenAI=USD，DashScope/ModelScope=CNY），数值为估算")
+    print(f"{'=' * 86}\n")

@@ -52,6 +52,8 @@ DEFAULT_MODEL=Qwen/Qwen3-235B-A22B
 
 Other providers: DeepSeek (¥5-10/novel), DashScope (¥4/M tokens), Claude ($15/M output), Ollama (free, local GPU).
 
+> **成本口径（重要）**：`src/utils/cost_calculator.py` 的单价表按各 provider 的**原生币种**记录——Anthropic / OpenAI / OpenRouter 为 **USD / 1M tokens**，DashScope（通义千问）/ ModelScope 为 **CNY**。币种映射见 `PROVIDER_CURRENCY`；`estimate.format(display_currency="CNY")` 可折算展示，`print_cost_comparison()` 会同时打印原生币种与 USD 近似值。折算汇率是 `USD_TO_CNY`（默认 7.2），**仅用于横向比较，不用于结算**；表内数值均为量级估算，实际以各 provider 官方价格页 / 账单为准。
+
 ### 3. Launch
 
 ```bash
@@ -252,7 +254,7 @@ uv run python eval/eval_rag_retrieval.py
 | 版本 | 得分 | 主要变化 |
 |---|---|---|
 | `eval/evaluation_report.md`（v1.0） | **13.5 / 25** | 列出 3 项阻断：B1 无显式反馈入口 / B2 无 Bad Case 管理 / B3 无埋点方案 |
-| `eval/evaluation_report_v2.md`（v2.0） | **16.0 / 25（+2.5）** | B1、B2 已解决，B3 降级为条件；新增 **44 条边缘用例并全部通过**；30 章成本核算 **\$12.30 → \$7.04（-43%）** |
+| `eval/evaluation_report_v2.md`（v2.0） | **16.0 / 25（+2.5）** | B1、B2 已解决，B3 降级为条件；新增 **44 条边缘用例并全部通过**；30 章成本核算 **\$12.30 → \$7.04（-43%，Anthropic 价目，USD）** |
 
 评审框架本身（5 大维度 / 19 条准则 / 25 分制）开源在 [ai-product-evaluation](https://github.com/HuangLeijiana/ai-product-evaluation)。
 
