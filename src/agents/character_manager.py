@@ -25,14 +25,15 @@ logger = logging.getLogger(__name__)
 class CharacterProfilesOutput(BaseModel):
     """LLM output schema for character profiles."""
 
-    characters: list[CharacterProfile] = Field(default_factory=list)
+    characters: list[CharacterProfile] = Field(..., min_length=1)
 
 
 class RelationshipMapOutput(BaseModel):
     """LLM output schema for relationship mapping."""
 
     relationships: dict[str, list[Relationship]] = Field(
-        default_factory=dict,
+        ...,
+        min_length=1,
         description="Mapping: character_id -> list of relationships",
     )
 
@@ -41,7 +42,8 @@ class CharacterArcOutput(BaseModel):
     """LLM output schema for character arcs."""
 
     arcs: dict[str, list[ArcBeat]] = Field(
-        default_factory=dict,
+        ...,
+        min_length=1,
         description="Mapping: character_id -> arc beats",
     )
 
@@ -60,6 +62,10 @@ class CharacterManagerAgent(BaseAgent):
         self,
         config: ProjectConfig,
         bible: NovelBible,
+        registry: CharacterRegistry | None = None,
+        progress: dict[str, bool] | None = None,
+        checkpoint=None,
+        story_context: str = "",
     ) -> CharacterRegistry:
         """Create all major characters for the novel.
 
@@ -70,22 +76,60 @@ class CharacterManagerAgent(BaseAgent):
         """
         logger.info("Creating characters...")
 
-        # Step 1: Generate profiles
-        profiles = await self._generate_profiles(config, bible)
+        registry = registry if registry is not None else CharacterRegistry()
+        progress = progress if progress is not None else {}
+        slots = [
+            ("char_mc", "protagonist"), ("char_ant", "antagonist"),
+            ("char_ally", "deuteragonist"), ("char_mentor", "mentor"),
+            ("char_support_1", "supporting"), ("char_support_2", "supporting"),
+        ]
+        for cid, role in slots:
+            if progress.get(cid) and cid in registry.characters:
+                continue
+            profile = await self._generate_one_profile(config, bible, cid, role, registry, story_context)
+            registry.characters[cid] = profile
+            progress[cid] = True
+            if checkpoint:
+                await checkpoint(registry, progress, f"角色资料已保存：{profile.name}（{len(registry.characters)}/6）")
 
-        # Build registry
-        registry = CharacterRegistry()
-        for profile in profiles:
-            registry.characters[profile.id] = profile
-
-        # Step 2: Build relationships
-        registry = await self.build_relationships(registry, bible)
-
-        # Step 3: Design arcs (for major characters)
-        registry = await self.design_arcs(registry, bible)
+        if not progress.get("relationships"):
+            registry = await self.build_relationships(registry, bible)
+            progress["relationships"] = True
+            if checkpoint:
+                await checkpoint(registry, progress, "角色关系已保存")
+        if not progress.get("arcs"):
+            registry = await self.design_arcs(registry, bible)
+            progress["arcs"] = True
+            if checkpoint:
+                await checkpoint(registry, progress, "角色成长弧线已保存")
+        progress["complete"] = True
+        if checkpoint:
+            await checkpoint(registry, progress, "角色创建全部完成，等待确认")
 
         logger.info(f"Created {len(registry.characters)} characters")
         return registry
+
+    async def _generate_one_profile(self, config, bible, cid, role, registry, story_context):
+        existing = "\n".join(f"{c.id}: {c.name}（{c.role}）{c.motivation[:80]}" for c in registry.characters.values())
+        system = self.build_system_prompt("角色设计师", "创造有动机、缺陷和独特声音的小说角色。只返回一个完整 JSON 对象。")
+        user = (
+            f"为《{config.title}》只创建一个角色，id 必须是 {cid}，role 必须是 {role}。\n"
+            f"题材：{', '.join(config.genre)}\n故事灵感：{config.inspiration}\n"
+            f"世界：{bible.world.name}；{bible.world.world_type}\n"
+            f"势力：{', '.join(f.name for f in bible.factions)}\n"
+            f"冲突：{'；'.join(c.description for c in bible.core_conflicts)[:1800]}\n"
+            f"已确定的故事设定：{story_context[:5500]}\n已有角色（不得重复名字或职责）：\n{existing}\n"
+            "字段：id、name、role、archetype、age（整数）、gender、appearance、personality、motivation、flaw、backstory、abilities（字符串数组）。"
+            "外貌与性格各不超过80字，背景不超过180字，能力最多4项。本步 arc 和 relationships 均使用空数组，后续单独设计。"
+            "必须返回 JSON 对象本身，不要包 characters 数组，不要表格或注释。"
+        )
+        profile = await self.generate_structured(
+            system_prompt=system, user_prompt=user, response_model=CharacterProfile,
+            temperature_override=0.6, max_tokens_override=3072,
+        )
+        profile.id = cid
+        profile.role = role
+        return profile
 
     async def _generate_profiles(
         self,
@@ -211,12 +255,14 @@ class CharacterManagerAgent(BaseAgent):
             char_list=char_list,
             theme_names=", ".join(t.name for t in bible.themes),
         )
+        user += "\n每个角色最多3条关键关系，history 和 notes 各不超过40字；字典键和 target_id 必须替换成上面列表中真实的角色 id，不使用 character_id 等占位符。"
 
         result = await self.generate_structured(
             system_prompt=system,
             user_prompt=user,
             response_model=RelationshipMapOutput,
             temperature_override=0.6,
+            max_tokens_override=6144,
         )
 
         # Apply relationships to characters

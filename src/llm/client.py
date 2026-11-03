@@ -15,6 +15,7 @@ class LLMResponse(BaseModel):
     input_tokens: int = Field(default=0, description="Input token count")
     output_tokens: int = Field(default=0, description="Output token count")
     cost: float = Field(default=0.0, description="Estimated cost in USD")
+    finish_reason: str | None = Field(default=None, description="Provider termination reason, e.g. stop or length")
 
 
 class BaseLLMProvider(ABC):

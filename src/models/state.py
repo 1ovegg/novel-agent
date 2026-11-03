@@ -13,7 +13,7 @@ from .memory import MemoryState
 from .outline import ChapterPlan, MasterOutline
 from .project import ProjectConfig, ProjectMeta
 from .review import ReviewReport
-from .topic import TopicResearchState
+from .topic import MiniArcOutline, TopicResearchState
 
 
 class MainState(BaseModel):
@@ -43,6 +43,9 @@ class MainState(BaseModel):
         default=None,
         description="Character registry (populated in Phase 2)",
     )
+    character_creation_progress: dict[str, bool] = Field(
+        default_factory=dict, description="Completed character profiles, relationships and arcs for resumable creation",
+    )
     outline: MasterOutline | None = Field(
         default=None,
         description="Master outline with volumes (populated in Phase 3)",
@@ -55,6 +58,14 @@ class MainState(BaseModel):
         default=None,
         description="Current chapter draft (populated in Phase 5)",
     )
+    polish_progress: dict[str, Any] = Field(
+        default_factory=dict, description="Saved polished passages for the current draft and feedback",
+    )
+    writing_progress: dict[str, Any] = Field(
+        default_factory=dict, description="Saved draft generation and passage-level fact extraction checkpoints",
+    )
+    topic_preparation_progress: dict[str, Any] = Field(default_factory=dict)
+    mini_arc_preparation_progress: dict[str, Any] = Field(default_factory=dict)
     review_report: ReviewReport | None = Field(
         default=None,
         description="Latest review report (populated in Phase 6)",
@@ -77,7 +88,7 @@ class MainState(BaseModel):
         default=None,
         description="Topic research pipeline state (Steps 1-4: scan→benchmark→select→title)",
     )
-    mini_arc_outline: dict | None = Field(
+    mini_arc_outline: dict[str, MiniArcOutline] | None = Field(
         default=None,
         description="10-chapter mini-arc outlines keyed by genre name",
     )
@@ -94,7 +105,7 @@ class MainState(BaseModel):
     )
     current_chapter_number: int = Field(
         default=0,
-        description="Chapter currently being worked on (0 = not started)",
+        description="Number of fully completed consecutive chapters; current work targets this number + 1",
     )
     total_chapters: int = Field(
         default=0,
@@ -200,6 +211,8 @@ class MainState(BaseModel):
         self.chapter_draft = None
         self.review_report = None
         self.polished_chapter = None
+        self.writing_progress = {}
+        self.polish_progress = {}
         self.review_iteration = 0
         self.human_feedback = None
         self.human_decision = None

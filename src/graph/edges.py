@@ -33,6 +33,9 @@ def review_decision(state: MainState) -> Literal["accept", "revise", "rewrite"]:
     if report is None:
         logger.warning("No review report — accepting by default")
         return ROUTE_ACCEPT
+    if not report.review_complete and "editor" in report.failed_checks and not report.has_critical:
+        logger.warning("主编辑审核未完成：保留草稿并继续润色，本章不计为审核通过")
+        return ROUTE_ACCEPT
 
     if state.review_iteration >= state.max_review_iterations:
         logger.info(f"Max review iterations ({state.max_review_iterations}) reached — forcing accept")
@@ -60,7 +63,7 @@ def next_chapter_or_done(state: MainState) -> Literal["next_chapter", "done"]:
     the state's total_chapters, with a floor of 3 (matching the original
     runtime so the loop always terminates).
     """
-    total = max(
+    total = state.project_config.target_chapter_count if state.project_config and state.project_config.target_chapter_count else max(
         (getattr(state.outline, "chapter_count", 0) if state.outline else 0),
         state.total_chapters,
         3,

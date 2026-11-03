@@ -1,6 +1,9 @@
 """Writer Agent — generates chapter drafts with full context awareness."""
 
+import hashlib
+import json
 import logging
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from pydantic import BaseModel, Field, model_validator
@@ -11,6 +14,7 @@ from ..models.characters import CharacterRegistry
 from ..models.memory import MemoryState
 from ..models.outline import ChapterPlan, EmotionalBeat, MasterOutline, Scene
 from ..models.project import ProjectConfig
+from ..utils.text_chunks import split_passages
 from .base import BaseAgent
 
 logger = logging.getLogger(__name__)
@@ -176,7 +180,7 @@ class WriterAgent(BaseAgent):
             "emotional_curve_formatted": self._format_emotional_curve(chapter_plan.emotional_curve),
             "characters_involved": ", ".join(chapter_plan.characters_involved),
             "scene_count": len(chapter_plan.scenes),
-            "per_scene_min": max(1000, chapter_plan.word_count_target // max(len(chapter_plan.scenes), 1)),
+            "per_scene_min": max(100, chapter_plan.word_count_target // max(len(chapter_plan.scenes), 1)),
             "revision_feedback": revision_feedback or "",
         }
 
@@ -200,7 +204,7 @@ class WriterAgent(BaseAgent):
         user_default = f"""请根据以下章节规划，写作第{chapter_num}章。
 
 【⚠️ 字数强制要求 — 请先读这条】
-全章总字数不得少于{chapter_plan.word_count_target}字。共{len(chapter_plan.scenes)}个场景，每个场景至少写{max(1000, chapter_plan.word_count_target // len(chapter_plan.scenes))}字。写完后请认真数一遍字数，不足必须扩充到达标为止。字数不够的章节会被系统打回重写。
+全章总字数不得少于{chapter_plan.word_count_target}字。共{len(chapter_plan.scenes)}个场景，每个场景至少写{max(100, chapter_plan.word_count_target // max(len(chapter_plan.scenes),1))}字。写完后请认真数一遍字数，不足必须扩充到达标为止。字数不够的章节会被系统打回重写。
 
 {context}
 
@@ -222,7 +226,7 @@ class WriterAgent(BaseAgent):
 
 写作要求：
 1. 严格遵循章节规划的场景顺序和情绪曲线
-2. 每个场景都要充分展开：环境描写（至少100字）→ 角色行动与对话（至少200字）→ 心理活动（至少100字）→ 情节推进（至少100字），确保每个场景有实质内容
+2. 每个场景都要充分展开：按本章预算分配环境、行动对话、心理和情节推进的篇幅，确保每个场景有实质内容
 3. 对话要符合每个角色的性格和说话方式，对话量要充足，不要一句话带过
 4. 描写要有画面感和细节，用具体的动作、表情、环境来传达情绪，不要直接说「他很愤怒」
 5. 章末必须有一个强有力的钩子：{chapter_plan.ending_hook}
@@ -240,6 +244,9 @@ class WriterAgent(BaseAgent):
             **template_vars,
         )
 
+        if config.target_chapter_count:
+            system += f"\n篇幅以作者预算为准：本章约{chapter_plan.word_count_target}字，上限约{int(chapter_plan.word_count_target * 1.1)}字，不要按长篇标准扩写。"
+            user += f"\n本章总预算约{chapter_plan.word_count_target}字，场景、对话、心理和环境共同分配此预算，不要求每个场景固定1000字。"
         result = await self.generate_structured(
             system_prompt=system,
             user_prompt=user,
@@ -300,6 +307,8 @@ class WriterAgent(BaseAgent):
         bible: NovelBible,
         characters: CharacterRegistry,
         memory: MemoryState | None = None,
+        progress: dict | None = None,
+        checkpoint: Callable[[str], Awaitable[None]] | None = None,
     ) -> ChapterDraft:
         """Extract new facts and character state changes from the chapter draft.
 
@@ -333,8 +342,52 @@ class WriterAgent(BaseAgent):
                     for f in relevant_facts[:30]
                 )
 
-        chapter_text = draft.content[:8000] if len(draft.content) > 8000 else draft.content
-        truncation_note = "...(内容过长已截断)" if len(draft.content) > 8000 else ""
+        passages = split_passages(draft.content, limit=1500)
+        if not passages or not draft.content.strip():
+            raise ValueError("初稿为空，无法提取事实")
+        fingerprint = hashlib.sha256(json.dumps(
+            [draft.chapter_number, draft.content, char_names, existing_facts_text], ensure_ascii=False,
+        ).encode("utf-8")).hexdigest()
+        progress = progress if progress is not None else {}
+        if progress.get("fingerprint") != fingerprint:
+            progress.clear()
+            progress.update(fingerprint=fingerprint, parts=[], total=len(passages))
+        for index in range(len(progress["parts"]), len(passages)):
+            if checkpoint:
+                await checkpoint(f"第{draft.chapter_number}章事实提取 {index + 1}/{len(passages)} 段，初稿已保存")
+            try:
+                result = await self._extract_passage(
+                    system, passages[index], char_names, existing_facts_text,
+                )
+            except Exception as exc:
+                raise ValueError(
+                    f"第{draft.chapter_number}章事实提取第{index + 1}/{len(passages)}段失败；"
+                    f"初稿及此前{len(progress['parts'])}段结果已保存，可继续，无需重写正文。原因：{exc}"
+                ) from exc
+            progress["parts"].append(result.model_dump(mode="json"))
+            if checkpoint:
+                await checkpoint(f"第{draft.chapter_number}章事实提取已保存 {index + 1}/{len(passages)} 段")
+
+        facts, changes, contradictions = {}, {}, []
+        for part in progress["parts"]:
+            result = FactExtractionOutput.model_validate(part)
+            for fact in result.new_facts:
+                fact.source_chapter = draft.chapter_number
+                facts[(fact.category, fact.description)] = fact
+            for change in result.state_changes:
+                changes[(change.character_id, change.attribute)] = change
+            contradictions.extend(result.contradictions)
+        draft.new_facts = list(facts.values())
+        draft.character_state_changes = list(changes.values())
+        for contradiction in dict.fromkeys(contradictions):
+            logger.warning("Chapter %s contradiction: %s", draft.chapter_number, contradiction)
+        logger.info("Extracted %s facts and %s state changes from chapter %s",
+                    len(draft.new_facts), len(draft.character_state_changes), draft.chapter_number)
+        return draft
+
+    async def _extract_passage(self, system, chapter_text, char_names, existing_facts_text):
+        """Bound each extraction response instead of growing an entire chapter's JSON."""
+        truncation_note = ""
 
         user = f"""请从以下章节中提取：
 
@@ -374,31 +427,20 @@ class WriterAgent(BaseAgent):
 检查本章新事实是否与已有事实矛盾。例如：
 - 已有事实说"李明左手在战斗中废掉了" → 本章写"李明双手握剑" → 矛盾
 - 已有事实说"北域终年冰封" → 本章写"北域春暖花开" → 矛盾（除非有合理解释）
-如果发现矛盾，将矛盾描述写入 contradictions 列表。无矛盾则为空列表。"""
+如果发现矛盾，将矛盾描述写入 contradictions 列表。无矛盾则为空列表。
+
+这是单个原文片段，最多提取6条关键事实、4条角色状态变化、2条矛盾。
+每条描述或原因不超过40个汉字；old_value和new_value使用短字符串。
+只提取这个片段确立的信息，不推演后续情节，不复述整段正文。"""
 
         result = await self.generate_structured(
             system_prompt=system,
             user_prompt=user,
             response_model=FactExtractionOutput,
             temperature_override=0.3,
-            max_tokens_override=2048,
+            max_tokens_override=8192,
         )
-
-        draft.new_facts = result.new_facts
-        draft.character_state_changes = result.state_changes
-
-        if result.contradictions:
-            logger.warning(
-                f"Chapter {draft.chapter_number}: {len(result.contradictions)} fact contradictions detected!"
-            )
-            for c in result.contradictions:
-                logger.warning(f"  Contradiction: {c}")
-
-        logger.info(
-            f"Extracted {len(draft.new_facts)} facts, {len(draft.character_state_changes)} state changes, "
-            f"{len(result.contradictions)} contradictions"
-        )
-        return draft
+        return result
 
     # ================================================================
     # Helpers

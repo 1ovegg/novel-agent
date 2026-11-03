@@ -35,6 +35,8 @@ class ReviewReport(BaseModel):
     """Complete quality review report for a chapter."""
 
     chapter_number: int = Field(default=0, description="Chapter being reviewed")
+    review_complete: bool = True
+    failed_checks: list[str] = Field(default_factory=list)
     overall_score: float = Field(
         default=7.0,
         description="Overall quality score (0-10)",

@@ -57,7 +57,7 @@ const Components = {
             <p>语调：${this.TONE[c.tone]||c.tone||'未指定'}</p>
             <p>篇幅：${c.target_length||'未指定'}（约${(c.target_word_count||0).toLocaleString()}字）</p>
             ${c.style_reference?`<p>风格参考：${this._esc(c.style_reference)}</p>`:''}`;
-        return this._editableSection('overview-basic', '基本信息', content, content.replace(/<[^>]+>/g,''));
+        return `<div class="section"><div class="section-header"><h4>基本信息</h4><button class="btn btn-secondary btn-sm" onclick="App.editBookTitle(App.currentProjectId)">编辑书名</button></div>${content}</div>`;
     },
 
     bibleEditable(bible) {
@@ -193,15 +193,15 @@ const Components = {
                 const cn = this._CN_NUM[num] || num;
                 const st = this._STATUS[ch.status] || ch.status || '未开始';
                 return `<div class="card" style="cursor:pointer">
-                    <div onclick="App.viewChapter(${num})" style="flex:1">
+                    <button class="book-title-link" onclick="App.viewChapter(${num})" style="flex:1">
                         <h3>第${cn}章 ${this._esc(ch.title)}</h3>
                         <span class="status status-${ch.status||'initialized'}">${st}</span>
-                    </div>
+                    </button>
                     <button class="btn btn-error btn-sm" onclick="event.stopPropagation();App.deleteChapter(${num})" style="margin-left:8px;flex-shrink:0">删除</button>
                 </div>`;
             }).join('');
             if (partial) {
-                const done = chapters.length;
+                const done = chapters.filter(chapter => chapter.status === 'done').length;
                 html += `<div class="section" style="margin-top:12px"><p>已完成 ${this._CN_NUM[done]||done} 章${totalChapters ? ' / 共 '+totalChapters+' 章' : ''}</p><button class="btn btn-primary" onclick="App.startWorkflow()">继续生成</button></div>`;
             }
         }
@@ -240,28 +240,9 @@ const Components = {
 
     topicResearchView() {
         return `<div class="section">
-            <h4>市场调研 · 平台扫榜</h4>
-            <p style="color:var(--text-secondary);margin-bottom:16px">
-                粘贴飞卢和/或番茄小说榜单页面的 HTML 内容（支持纯文本，最多 15000 字），
-                AI 将自动提取热门题材、分析趋势并生成选题建议。
-            </p>
-            <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
-                <div class="form-group">
-                    <label for="scan-feilu"><strong>飞卢小说榜单</strong></label>
-                    <textarea id="scan-feilu" placeholder="粘贴飞卢榜单页面内容..." style="width:100%;min-height:200px;padding:10px;background:var(--bg-input);border:1px solid var(--border);border-radius:6px;color:var(--text-primary);font-family:monospace;font-size:0.85rem;resize:vertical"></textarea>
-                </div>
-                <div class="form-group">
-                    <label for="scan-fanqie"><strong>番茄小说榜单</strong></label>
-                    <textarea id="scan-fanqie" placeholder="粘贴番茄榜单页面内容..." style="width:100%;min-height:200px;padding:10px;background:var(--bg-input);border:1px solid var(--border);border-radius:6px;color:var(--text-primary);font-family:monospace;font-size:0.85rem;resize:vertical"></textarea>
-                </div>
-            </div>
-            <div class="confirm-actions" style="margin-top:16px">
-                <button class="btn btn-primary" onclick="App.submitScan()">开始扫榜分析</button>
-            </div>
-            <p class="hint" style="margin-top:8px;color:var(--text-secondary);font-size:0.8rem">
-                提示：可以使用浏览器开发者工具 (F12) 复制榜单页面的 HTML，或在 Playwright 中抓取页面内容后粘贴。
-                扫榜完成后将自动进入「选题研究 → 小事件大纲」流程，之后再进入世界观构建。
-            </p>
+            <h4>选题研究</h4>
+            <p>前往工作台输入题材类型和故事灵感。需要市场参考时，可读取今日已缓存的榜单。</p>
+            <button class="btn btn-primary" onclick="App._navigate('workspace')">回到创作工作台</button>
         </div>`;
     },
 

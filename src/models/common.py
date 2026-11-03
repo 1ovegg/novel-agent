@@ -41,6 +41,7 @@ class WorkflowPhase(StrEnum):
     # Core pipeline
     PROJECT_INIT = "project_init"
     BIBLE_CONSTRUCTION = "bible_construction"
+    CHARACTER_CREATION = "character_creation"
     MASTER_OUTLINE = "master_outline"
     CHAPTER_PLANNING = "chapter_planning"
     CHAPTER_WRITING = "chapter_writing"

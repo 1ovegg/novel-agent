@@ -33,6 +33,8 @@ class WebSocketManager:
 
     async def broadcast(self, project_id: str, event: dict[str, Any]) -> None:
         """Send an event to all WebSocket connections for a project."""
+        from .runtime import runtime_status
+        runtime_status.observe(project_id, event)
         if project_id not in self._connections:
             return
         message = json.dumps(event, ensure_ascii=False, default=str)

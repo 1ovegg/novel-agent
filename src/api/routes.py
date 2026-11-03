@@ -5,9 +5,10 @@ import json
 import logging
 import re
 import uuid
+from contextlib import suppress
+from typing import Literal
 
-from fastapi import APIRouter, File, HTTPException, UploadFile
-from fastapi.responses import StreamingResponse
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from ..graph.nodes import get_chapter_phase as _get_chapter_phase
@@ -18,7 +19,27 @@ from .dependencies import get_file_manager, get_scheduler
 from .websocket import ws_manager
 
 logger = logging.getLogger(__name__)
-router = APIRouter()
+
+
+async def _trace_project_request(request: Request):
+    """Keep direct project actions and graph background calls in the same trace."""
+    from .runtime import execution_context, project_context, runtime_status
+
+    project_id = request.path_params.get("project_id")
+    if not project_id:
+        yield
+        return
+    runtime_status.bind_project(project_id, get_file_manager(project_id))
+    token = project_context.set(project_id)
+    execution = execution_context.set({"phase": request.path_params.get("phase") or runtime_status.projects.get(project_id, {}).get("phase")})
+    try:
+        yield
+    finally:
+        execution_context.reset(execution)
+        project_context.reset(token)
+
+
+router = APIRouter(dependencies=[Depends(_trace_project_request)])
 
 # In-memory project state registry (for MVP; replace with DB later)
 _active_projects: dict[str, dict] = {}  # project_id -> {state, workflow, thread_config}
@@ -51,6 +72,89 @@ class CreateProjectRequest(BaseModel):
     """Request to create a new project."""
 
     config: ProjectConfig
+
+
+class StartWorkflowRequest(BaseModel):
+    topic_source: Literal["manual", "rankings"]
+    topic_type: str = Field(default="", max_length=200)
+    inspiration: str = Field(default="", max_length=2000)
+    target_word_count: int | None = Field(default=None, ge=1000, le=500000)
+    target_chapter_count: int | None = Field(default=None, ge=1, le=200)
+
+
+@router.get("/rankings/today")
+async def today_rankings():
+    from .daily_rankings import get_daily_rankings
+    cache = get_daily_rankings()
+    if cache.snapshot()["status"] == "idle":
+        cache.schedule()
+    return cache.snapshot()
+
+
+@router.post("/rankings/refresh")
+async def refresh_rankings():
+    from .daily_rankings import get_daily_rankings
+    cache = get_daily_rankings()
+    cache.schedule(force=True)
+    return {"status": "scheduled", "message": "已提交今日榜单重试任务"}
+
+
+@router.post("/rankings/topics/refresh")
+async def refresh_prepared_topics():
+    from .daily_rankings import get_daily_rankings
+    cache = get_daily_rankings()
+    if not cache.snapshot().get("platforms"):
+        raise HTTPException(status_code=409,detail="今日有效榜单尚未准备好，请先完成扫榜")
+    cache.schedule_topics()
+    return {"status":"scheduled","message":"正在补齐今日选题缓存，已完成卡片不会重复生成"}
+
+
+@router.get("/runtime")
+async def runtime_snapshot(project_id: str | None = None):
+    from .agent_trace import agent_traces
+    from .daily_rankings import get_daily_rankings
+    from .runtime import runtime_status
+    from .saved_agent_work import saved_agent_work
+    if project_id:
+        runtime_status.bind_project(project_id, get_file_manager(project_id))
+    result = {**runtime_status.snapshot(project_id), "rankings": get_daily_rankings().snapshot()}
+    result["agent_calls"] = agent_traces.summaries(project_id) if project_id else []
+    result["project_id"] = project_id
+    result["agent_activity"] = agent_traces.activity(project_id) if project_id else {}
+    result["agent_trace"] = {"enabled": True, "version": 1, "session_id": runtime_status.session_id}
+    result["saved_agent_activity"] = saved_agent_work(get_file_manager(project_id)) if project_id else {}
+    if project_id and project_id not in runtime_status.projects:
+        record = _workspace_record(project_id)
+        if record:
+            result["project"] = _stored_runtime(record)
+    proj = _active_projects.get(project_id, {})
+    task = proj.get("task")
+    if result["project"]["status"] == "waiting" and proj.get("state") and (not task or task.done()):
+        from .phase_executor import get_phase_data
+        result["phase_data"] = get_phase_data(proj["state"], result["project"].get("phase"))
+    return result
+
+
+@router.get("/projects/{project_id}/agent-calls")
+async def agent_call_history(project_id: str, agent: str):
+    from .agent_trace import agent_traces
+    from .saved_agent_work import saved_agent_work
+
+    # A single agent's full history must remain available after other agents run.
+    calls = agent_traces.summaries(project_id, agent=agent, limit=None)
+    return {"calls": calls, "total": len(calls), "saved_work": saved_agent_work(get_file_manager(project_id), agent)}
+
+
+@router.get("/projects/{project_id}/agent-calls/{call_id}")
+async def agent_call_detail(project_id: str, call_id: str):
+    from .agent_trace import agent_traces
+    from .runtime import runtime_status
+
+    runtime_status.bind_project(project_id, get_file_manager(project_id))
+    record = agent_traces.detail(project_id, call_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="未找到该智能体调用记录")
+    return record
 
 
 class ProjectResponse(BaseModel):
@@ -187,17 +291,21 @@ async def list_projects():
             fm = get_file_manager(proj_dir.name)
             meta = fm.load_project_meta()
             config = fm.load_project_config()
+            saved = fm.load_workflow_state()
             projects.append(
                 {
                     "project_id": proj_dir.name,
                     "title": meta.title if meta else config.inspiration[:50] if config else proj_dir.name,
-                    "status": meta.status if meta else "initialized",
-                    "current_phase": meta.current_phase if meta else "idle",
+                    "status": saved.get("status", "initialized") if saved else meta.status if meta else "initialized",
+                    "current_phase": saved.get("phase", "idle") if saved else meta.current_phase if meta else "idle",
                     "current_chapter": meta.current_chapter if meta else 0,
                     "total_chapters": meta.total_chapters if meta else 0,
+                    "updated_at": saved.get("updated_at", "") if saved else meta.updated_at if meta else "",
+                    "can_resume": saved.get("status") in ("waiting", "running", "failed", "paused", "interrupted") if saved else bool(meta and str(meta.status) in ("paused", "error")),
+                    "resume_phase": saved.get("phase") if saved else str(meta.current_phase) if meta else "idle",
                 }
             )
-    return projects
+    return sorted(projects, key=lambda project: project["updated_at"], reverse=True)
 
 
 @router.get("/projects/{project_id}")
@@ -215,21 +323,144 @@ async def get_project(project_id: str):
     }
 
 
+def _workspace_record(project_id):
+    """Recover outputs from disk without starting a graph or calling an LLM."""
+    fm = get_file_manager(project_id)
+    config = fm.load_project_config()
+    if not config:
+        return None
+    record = fm.load_workflow_state()
+    if record:
+        record = {**record, "state": MainState.model_validate(record["state"])}
+    else:
+        meta = fm.load_project_meta()
+        state = MainState(
+            project_config=config, project_meta=meta,
+            topic_research=fm.load_topic_research(), mini_arc_outline=fm.load_mini_arc_outlines(),
+            bible=fm.load_bible(), characters=fm.load_characters(), outline=fm.load_master_outline(),
+        )
+        phase = str(meta.current_phase) if meta else "idle"
+        for candidate, artifact in (
+            ("master_outline", state.outline), ("character_creation", state.characters),
+            ("bible_construction", state.bible), ("mini_arc_outline", state.mini_arc_outline),
+            ("topic_selection", state.topic_research and state.topic_research.candidates),
+        ):
+            if artifact:
+                phase = candidate
+                break
+        record = {"state": state, "status": "waiting" if phase != "idle" else "idle", "phase": phase,
+                  "updated_at": meta.updated_at if meta else None}
+    record["state"].project_config = config
+    return record
+
+
+def _stored_runtime(record):
+    status = record["status"]
+    paused = status in ("running", "paused", "interrupted")
+    return {
+        "status": "paused" if paused else status, "phase": record["phase"],
+        "message": (record.get("error") or "上次生成失败，可从当前步骤继续") if status == "failed" else "生成进度已保存，可继续上次生成" if paused else "已恢复保存的进度，确认后可继续" if status == "waiting" else "已恢复创作记录",
+        "updated_at": record.get("updated_at"), "needs_resume": True,
+    }
+
+
+@router.get("/projects/{project_id}/workspace")
+async def get_workspace(project_id: str):
+    from .phase_executor import get_phase_data
+    from .runtime import runtime_status
+    runtime_status.bind_project(project_id, get_file_manager(project_id))
+    record = _workspace_record(project_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="项目不存在")
+    phases = ("topic_selection", "mini_arc_outline", "bible_construction", "character_creation", "master_outline")
+    return {
+        "config": record["state"].project_config.model_dump(mode="json"),
+        "runtime": runtime_status.projects.get(project_id) or _stored_runtime(record),
+        "results": {phase: data for phase in phases if (data := get_phase_data(record["state"], phase))},
+    }
+
+
+@router.post("/projects/{project_id}/manual-topic")
+async def return_to_manual_topic(project_id: str):
+    """Stop only upstream topic research; preserve all existing results on disk."""
+    from .runtime import runtime_status
+    record = _workspace_record(project_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="项目不存在")
+    proj = _active_projects.get(project_id, {})
+    phase = runtime_status.projects.get(project_id, {}).get("phase", record["phase"])
+    if phase not in ("topic_selection", "idle", "project_init"):
+        raise HTTPException(status_code=409, detail="项目已进入后续创作阶段，可新建草稿自主创作，原成果会保留")
+    task = proj.get("task")
+    if task and not task.done():
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+        record = _workspace_record(project_id) or record
+    fm = get_file_manager(project_id)
+    config = record["state"].project_config
+    config.topic_source = "manual"
+    fm.save_project_config(config)
+    record["state"].project_config = config
+    fm.save_workflow_state(record["state"], "editing", "topic_selection")
+    await ws_manager.broadcast(project_id, {"type": "topic_editing", "phase": "topic_selection", "message": "已切回自主创作，现有结果已保留"})
+    return {"status": "editing"}
+
+
 @router.delete("/projects/{project_id}")
 async def delete_project(project_id: str):
-    """Delete a project and all its artifacts."""
+    """Stop work before moving the project to a recoverable local trash folder."""
     import shutil
 
+    from .runtime import runtime_status
+
     fm = get_file_manager(project_id)
+    projects_root = (fm.workspace_root / "projects").resolve()
+    if fm.root.resolve().parent != projects_root:
+        raise HTTPException(status_code=400, detail="无效项目路径")
     if not fm.exists():
         raise HTTPException(status_code=404, detail="Project not found")
-    shutil.rmtree(fm.root)
+    task = _active_projects.get(project_id, {}).get("task")
+    if task and not task.done():
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+    archive_id = uuid.uuid4().hex
+    archive = fm.workspace_root / ".trash" / "projects" / archive_id
+    archive.mkdir(parents=True)
+    (archive / "manifest.json").write_text(json.dumps({"project_id": project_id}, ensure_ascii=False), encoding="utf-8")
+    shutil.move(str(fm.root), str(archive / "data"))
     _active_projects.pop(project_id, None)
-    return {"status": "deleted"}
+    runtime_status.projects.pop(project_id, None)
+    runtime_status.project_files.pop(project_id, None)
+    runtime_status.disk_events.pop(project_id, None)
+    runtime_status.events = __import__("collections").deque(
+        (event for event in runtime_status.events if event["project_id"] != project_id), maxlen=400,
+    )
+    return {"status": "deleted", "archive_id": archive_id}
+
+
+@router.post("/trash/{archive_id}/restore")
+async def restore_project(archive_id: str):
+    import shutil
+    if not re.fullmatch(r"[0-9a-f]{32}", archive_id):
+        raise HTTPException(status_code=400, detail="无效回收记录")
+    fm = get_file_manager("restore-target")
+    archive = fm.workspace_root / ".trash" / "projects" / archive_id
+    if not (archive / "data").is_dir():
+        raise HTTPException(status_code=404, detail="回收记录不存在")
+    project_id = json.loads((archive / "manifest.json").read_text(encoding="utf-8"))["project_id"]
+    target = get_file_manager(project_id)
+    if target.root.resolve().parent != (fm.workspace_root / "projects").resolve():
+        raise HTTPException(status_code=400, detail="无效恢复路径")
+    if target.root.exists():
+        raise HTTPException(status_code=409, detail="同名项目已存在")
+    shutil.move(str(archive / "data"), str(target.root))
+    return {"status": "restored", "project_id": project_id}
 
 
 class UpdateTitleRequest(BaseModel):
-    title: str
+    title: str = Field(min_length=1, max_length=100)
 
 
 @router.put("/projects/{project_id}/title")
@@ -238,13 +469,28 @@ async def update_project_title(project_id: str, req: UpdateTitleRequest):
     fm = get_file_manager(project_id)
     if not fm.exists():
         raise HTTPException(status_code=404, detail="Project not found")
+    if not req.title.strip():
+        raise HTTPException(status_code=422, detail="书名不能为空")
+    task = _active_projects.get(project_id, {}).get("task")
+    if task and not task.done():
+        raise HTTPException(status_code=409, detail="请先保存并暂停生成，再编辑书名")
     config = fm.load_project_config()
     if config:
         config.title = req.title
         fm.save_project_config(config)
     from ..models.project import ProjectMeta
 
-    fm.save_project_meta(ProjectMeta(project_id=project_id, title=req.title))
+    meta = fm.load_project_meta() or ProjectMeta(project_id=project_id)
+    meta.title = req.title
+    fm.save_project_meta(meta)
+    record = fm.load_workflow_state()
+    if record:
+        state = MainState.model_validate(record["state"])
+        state.project_config = config
+        state.project_meta = meta
+        fm.save_workflow_state(state, record["status"], record["phase"], error=record.get("error"))
+        if project_id in _active_projects:
+            _active_projects[project_id]["state"] = state
     return {"status": "ok", "title": req.title}
 
 
@@ -280,21 +526,77 @@ class PhaseConfirmationRequest(BaseModel):
     """Request to confirm phase and provide input."""
 
     inspiration: str | None = Field(default=None)
+    selected_topic: dict | None = None
 
 
 @router.post("/projects/{project_id}/start")
-async def start_workflow(project_id: str):
+async def start_workflow(project_id: str, req: StartWorkflowRequest | None = None):
     """Start the phased interactive workflow. Skips phases that already have content."""
     fm = get_file_manager(project_id)
     config = fm.load_project_config()
     if not config:
         raise HTTPException(status_code=404, detail="Project not found")
 
+    existing = _active_projects.get(project_id, {}).get("task")
+    if existing and not existing.done():
+        return {"status": "already_running", "project_id": project_id}
+
+    if req is None:
+        record = _workspace_record(project_id)
+        if record and record["status"] in ("waiting", "running", "failed", "paused", "interrupted"):
+            await _prime_saved_workflow(project_id, record)
+            if _active_projects[project_id].get("resume_direct"):
+                _active_projects[project_id]["task"] = asyncio.create_task(_resume_graph_workflow(project_id, {}))
+            return {"status": "restored", "project_id": project_id}
+
+    if req:
+        if req.topic_source == "manual" and not (req.topic_type.strip() or req.inspiration.strip()):
+            raise HTTPException(status_code=422, detail="请填写题材类型或故事灵感")
+        config.topic_source = req.topic_source
+        config.topic_type = req.topic_type.strip()
+        if req.inspiration.strip():
+            config.inspiration = req.inspiration.strip()
+        if config.topic_type:
+            config.genre = [config.topic_type]
+        size = {key:getattr(req,key) for key in ("target_word_count","target_chapter_count") if getattr(req,key) is not None}
+        if size:
+            try:
+                config = ProjectConfig.model_validate({**config.model_dump(),**size})
+            except ValueError as exc:
+                raise HTTPException(status_code=422,detail=str(exc)) from exc
+        fm.save_project_config(config)
+
     from ..models.project import ProjectMeta
 
     meta = fm.load_project_meta() or ProjectMeta(project_id=project_id)
 
-    initial_state = MainState(project_meta=meta, project_config=config)
+    initial_state = MainState(
+        project_meta=meta,
+        project_config=config,
+        mini_arc_outline=fm.load_mini_arc_outlines(),
+        topic_research=fm.load_topic_research(),
+    )
+    if req is not None and not initial_state.mini_arc_outline and not fm.load_bible():
+        initial_state.topic_research = None
+    if config.topic_source and initial_state.topic_research is None:
+        from ..models.topic import ScanReport, TopicResearchState
+        if config.topic_source == "rankings":
+            from .daily_rankings import get_daily_rankings
+            snapshot = get_daily_rankings().snapshot()
+            if snapshot["status"] not in ("ready", "partial"):
+                raise HTTPException(status_code=409, detail="今日榜单尚不可用，请等待后台完成或改为手动选题")
+            if not snapshot.get("topic_cards"):
+                raise HTTPException(status_code=409,detail=snapshot.get("topic_message") or "今日选题正在预生成，请查看今日选题状态或返回自主创作")
+            platforms = snapshot["platforms"]
+            initial_state.topic_research = TopicResearchState(
+                feilu_scan=ScanReport.model_validate(platforms["feilu"]) if platforms.get("feilu") else None,
+                fanqie_scan=ScanReport.model_validate(platforms["fanqie"]) if platforms.get("fanqie") else None,
+            )
+        else:
+            initial_state.topic_research = TopicResearchState()
+        fm.save_topic_research(initial_state.topic_research)
+    if config.topic_source:
+        initial_state.current_inspiration = config.inspiration
 
     # Load existing artifacts so we can skip completed phases
     existing_bible = fm.load_bible()
@@ -444,12 +746,8 @@ async def generate_synopsis_for_candidate(project_id: str, req: GenerateSynopsis
         }
     except Exception as e:
         logger.error(f"Synopsis generation failed: {e}")
-        return {
-            "genre_name": req.genre_name,
-            "final_title": req.genre_name,
-            "final_synopsis": req.inspiration or f"一部{req.genre_name}题材的精彩小说",
-            "title_candidates": [],
-        }
+        await ws_manager.broadcast_error(project_id, "topic_selection", str(e))
+        raise HTTPException(status_code=502, detail=f"书名简介生成失败：{str(e)}") from e
 
 
 @router.post("/projects/{project_id}/ai-titles")
@@ -477,6 +775,7 @@ async def ai_generate_titles(project_id: str, req: AiTitlesRequest):
 
     agent = BaseAgent.__new__(BaseAgent)
     agent.scheduler = scheduler
+    agent.agent_type = "topic_scout"
 
     system_prompt = f"""你是一个专业的网文书名创作专家。你需要基于用户的灵感，结合当前榜单趋势，生成吸睛的书名。
 
@@ -558,7 +857,7 @@ async def auto_scan(project_id: str):
     Fetches both platform ranking pages, stores the HTML, and starts
     the Phase 0 pipeline. Falls back gracefully if scraping fails.
     """
-    from ..utils.scraper import scrape_all
+    from .daily_rankings import get_daily_rankings
     from .phase_executor import _pending_scan_data
 
     # Ensure project entry exists
@@ -573,7 +872,9 @@ async def auto_scan(project_id: str):
         }
 
     # Scrape both platforms
-    results = await scrape_all()
+    cache = get_daily_rankings()
+    await cache.ensure()
+    results = (cache.current or {}).get("raw", {})
     feilu_html = results.get("feilu")
     fanqie_html = results.get("fanqie")
 
@@ -620,20 +921,72 @@ async def confirm_phase(project_id: str, req: PhaseConfirmationRequest):
     or completion.
     """
     proj = _active_projects.get(project_id)
-    if not proj:
-        raise HTTPException(status_code=404, detail="No active workflow")
+    if not proj or not proj.get("state"):
+        record = _workspace_record(project_id)
+        if not record or record["status"] not in ("waiting", "failed", "running", "paused", "interrupted"):
+            raise HTTPException(status_code=404, detail="没有可继续的任务，请先开始选题研究")
+        await _prime_saved_workflow(project_id, record)
+        proj = _active_projects[project_id]
 
-    proj["phase_input"] = {"inspiration": req.inspiration}
-
-    asyncio.create_task(_resume_graph_workflow(project_id, {"inspiration": req.inspiration}))
+    task = proj.get("task")
+    if task and not task.done():
+        raise HTTPException(status_code=409, detail="任务仍在执行，请等待当前阶段完成")
+    payload = {"inspiration": req.inspiration, "selected_topic": req.selected_topic}
+    proj["phase_input"] = payload
+    proj["task"] = asyncio.create_task(_resume_graph_workflow(project_id, payload))
 
     return {"status": "confirmed", "phase": proj.get("current_phase")}
 
 
 @router.post("/projects/{project_id}/pause")
 async def pause_workflow(project_id: str):
-    """Pause a running workflow."""
+    """Cancel the current request only after preserving its latest checkpoint."""
+    from ..models.common import ProjectStatus, WorkflowPhase
+    from .runtime import now_iso, runtime_status
+    record = _workspace_record(project_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="项目不存在")
+    proj = _active_projects.get(project_id, {})
+    task = proj.get("task")
+    if task and not task.done():
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+        record = _workspace_record(project_id) or record
+    if record["status"] == "completed":
+        return {"status": "completed", "project_id": project_id}
+    fm = get_file_manager(project_id)
+    runtime_status.bind_project(project_id, fm)
+    saved_status = "waiting" if record["status"] == "waiting" else "paused"
+    fm.save_workflow_state(record["state"], saved_status, record["phase"], error=record.get("error"))
+    meta = fm.load_project_meta()
+    if meta:
+        meta.status = ProjectStatus.PAUSED
+        meta.current_phase = WorkflowPhase(record["phase"])
+        meta.updated_at = now_iso()
+        fm.save_project_meta(meta)
+    await ws_manager.broadcast(project_id, {"type": "workflow_paused", "phase": record["phase"], "message": "进度和记录已保存，可以关闭页面；下次点击继续上次生成"})
     return {"status": "paused", "project_id": project_id}
+
+
+@router.post("/projects/{project_id}/resume")
+async def resume_workflow(project_id: str):
+    from .runtime import runtime_status
+    task = _active_projects.get(project_id, {}).get("task")
+    if task and not task.done():
+        return {"status": "already_running", "project_id": project_id}
+    record = _workspace_record(project_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="项目不存在")
+    if record["status"] == "completed":
+        return {"status": "completed", "project_id": project_id}
+    if record["status"] not in ("waiting", "running", "failed", "paused", "interrupted"):
+        raise HTTPException(status_code=409, detail="当前项目尚未开始生成，请先研究选题")
+    runtime_status.bind_project(project_id, get_file_manager(project_id))
+    result = await start_workflow(project_id)
+    if record["status"] != "waiting":
+        await ws_manager.broadcast(project_id, {"type": "workflow_resumed", "phase": record["phase"], "message": "正在从已保存步骤继续，已完成内容不会重复生成"})
+    return result
 
 
 @router.post("/projects/{project_id}/retry-phase/{phase}")
@@ -670,6 +1023,7 @@ async def retry_phase(project_id: str, phase: str, req: PhaseConfirmationRequest
     from ..agents.orchestrator import OrchestratorAgent
 
     orchestrator = OrchestratorAgent(scheduler)
+    orchestrator._rag_project_id = project_id
 
     label = PHASE_LABELS.get(phase, phase)
     await ws_manager.broadcast_phase_update(project_id, phase, 0.1, f"正在重新{label}...")
@@ -695,6 +1049,8 @@ async def retry_phase(project_id: str, phase: str, req: PhaseConfirmationRequest
 def _build_run_context(project_id: str) -> dict:
     """Build the LangGraph invocation config (thread = project_id)."""
     fm = _active_projects[project_id]["file_manager"]
+    from .runtime import runtime_status
+    runtime_status.bind_project(project_id, fm)
     scheduler = get_scheduler()
     from ..agents.orchestrator import OrchestratorAgent
 
@@ -749,6 +1105,7 @@ async def _run_graph_workflow(project_id: str):
 
     try:
         result = await get_graph().ainvoke(proj["state"], config=_build_run_context(project_id))
+        _save_run_state(proj, result)
         phase = _pending_interrupt_phase(result)
         if phase is not None:
             proj["current_phase"] = phase
@@ -782,8 +1139,9 @@ async def _resume_graph_workflow(project_id: str, resume_payload: dict):
 
     try:
         result = await get_graph().ainvoke(
-            Command(resume=resume_payload), config=_build_run_context(project_id)
+            None if proj.pop("resume_direct", False) else Command(resume=resume_payload), config=_build_run_context(project_id)
         )
+        _save_run_state(proj, result)
         phase = _pending_interrupt_phase(result)
         if phase is not None:
             proj["current_phase"] = phase
@@ -800,6 +1158,61 @@ async def _resume_graph_workflow(project_id: str, resume_payload: dict):
     except Exception as e:
         logger.error(f"Workflow resume error for {project_id}: {e}", exc_info=True)
         await ws_manager.broadcast_error(project_id, "workflow", str(e))
+
+async def _prime_saved_workflow(project_id, record):
+    """Rebuild a paused checkpoint from saved outputs without rerunning completed work."""
+    from ..graph.workflow import get_graph
+    waiting_nodes = {
+        "platform_scan": "platform_scan_work", "topic_selection": "topic_selection_work",
+        "mini_arc_outline": "mini_arc_work", "bible_construction": "bible_work",
+        "character_creation": "characters_work", "master_outline": "outline_work",
+    }
+    retry_nodes = {
+        "topic_selection": "project_init", "mini_arc_outline": "topic_selection_confirm",
+        "bible_construction": "bible_route", "character_creation": "characters_route",
+        "master_outline": "outline_route", "chapter_planning": "chapter_route",
+        "chapter_writing": "chapter_plan", "quality_review": "chapter_write",
+        "polish_revision": "chapter_review", "memory_update": "chapter_polish",
+    }
+    waiting = record["status"] == "waiting" and record["phase"] in waiting_nodes
+    _active_projects[project_id] = {
+        "state": record["state"], "file_manager": get_file_manager(project_id),
+        "phase_event": asyncio.Event(), "phase_input": {}, "current_phase": record["phase"],
+        "resume_direct": not waiting,
+    }
+    config = _build_run_context(project_id)
+    node = waiting_nodes[record["phase"]] if waiting else retry_nodes.get(record["phase"], "project_init")
+    await get_graph().aupdate_state(config, record["state"].model_dump(), as_node=node)
+    if waiting:
+        result = await get_graph().ainvoke(None, config=config)
+        _save_run_state(_active_projects[project_id], result)
+        await ws_manager.broadcast_phase_blocked(project_id, record["phase"])
+
+
+def _save_run_state(proj, result):
+    """Keep API retries and disk artifacts synchronized with the graph checkpoint."""
+    if not isinstance(result, dict):
+        return
+    state = MainState.model_validate(result)
+    proj["state"] = state
+    fm = proj.get("file_manager")
+    if fm and state.topic_research:
+        fm.save_topic_research(state.topic_research)
+    if fm and state.project_meta:
+        from ..models.common import ProjectStatus
+        from .runtime import now_iso
+        meta = fm.load_project_meta() or state.project_meta
+        from ..models.common import WorkflowPhase
+        meta.current_phase = WorkflowPhase(_pending_interrupt_phase(result) or state.current_phase)
+        meta.current_chapter = state.current_chapter_number
+        meta.total_chapters = state.total_chapters
+        meta.status = ProjectStatus.PAUSED if result.get("__interrupt__") else ProjectStatus.COMPLETED
+        meta.updated_at = now_iso()
+        fm.save_project_meta(meta)
+    if fm:
+        phase = _pending_interrupt_phase(result)
+        fm.save_workflow_state(state, "waiting" if phase else "completed", phase or state.current_phase)
+
 
 async def submit_human_decision(project_id: str, req: HumanDecisionRequest):
     """Submit a human decision with structured feedback (accept/revise/rewrite/rollback).
@@ -902,6 +1315,8 @@ async def list_chapters(project_id: str):
     chapters = []
     for num in plans:
         plan = fm.load_chapter_plan(num)
+        draft = fm.load_chapter_draft(num)
+        polished = fm.load_chapter_markdown(num)
         # Derive real status from the persisted per-chapter phase (0-5)
         phase = _get_chapter_phase(fm, num)
         status = (
@@ -916,6 +1331,8 @@ async def list_chapters(project_id: str):
                 "chapter_number": num,
                 "title": plan.title if plan else "",
                 "status": status,
+                "has_content": bool(polished), "has_draft": bool(draft and draft.content),
+                "word_count": len(polished or (draft.content if draft else "")),
             }
         )
     return chapters
@@ -929,6 +1346,11 @@ async def get_chapter(project_id: str, chapter_number: int):
     draft = fm.load_chapter_draft(chapter_number)
     review = fm.load_review_report(chapter_number)
     polished_md = fm.load_chapter_markdown(chapter_number)
+    record = fm.load_workflow_state() or {}
+    saved = record.get("state", {})
+    progress = saved.get("polish_progress", {})
+    current = saved.get("chapter_draft") or {}
+    partial = "\n\n".join(part.get("content", "") for part in progress.get("parts", [])) if current.get("chapter_number") == chapter_number else ""
 
     return {
         "chapter_number": chapter_number,
@@ -936,6 +1358,9 @@ async def get_chapter(project_id: str, chapter_number: int):
         "draft": draft.model_dump() if draft else None,
         "review": review.model_dump() if review else None,
         "content": polished_md,
+        "partial_polish": partial,
+        "polish_progress": {"completed": len(progress.get("parts", [])), "total": progress.get("total", 0)} if partial else None,
+        "updated_at": record.get("updated_at"),
     }
 
 
@@ -984,94 +1409,6 @@ async def export_book_docx(project_id: str):
     )
 
 
-# ============================================================
-# Conversational Editor — file upload, analysis, polish, rewrite
-# ============================================================
-
-
-class EditorChatRequest(BaseModel):
-    """Request for the conversational editor."""
-
-    message: str = Field(..., description="User message or instruction")
-    mode: str = Field(default="chat", description="Mode: chat, analyze, polish, rewrite")
-    context: str | None = Field(default=None, description="Current text content for context")
-
-
-@router.post("/projects/{project_id}/editor/upload")
-async def editor_upload(project_id: str, file: UploadFile = File(...)):
-    """Upload a .txt or .md file for editing."""
-    if not file.filename:
-        raise HTTPException(status_code=400, detail="No file provided")
-
-    content = await file.read()
-    try:
-        text = content.decode("utf-8")
-    except UnicodeDecodeError:
-        try:
-            text = content.decode("gbk")
-        except UnicodeDecodeError:
-            raise HTTPException(status_code=400, detail="Cannot decode file — use UTF-8 or GBK")
-
-    # Store in active project
-    proj = _active_projects.get(project_id, {})
-    if "uploaded_files" not in proj:
-        proj["uploaded_files"] = {}
-    file_id = str(uuid.uuid4())[:8]
-    proj["uploaded_files"][file_id] = {
-        "filename": file.filename,
-        "content": text,
-        "size": len(text),
-    }
-
-    return {
-        "file_id": file_id,
-        "filename": file.filename,
-        "size": len(text),
-        "preview": text[:500] + ("..." if len(text) > 500 else ""),
-    }
-
-
-@router.post("/projects/{project_id}/editor/chat")
-async def editor_chat(project_id: str, req: EditorChatRequest):
-    """Conversational editor — stream AI response via SSE."""
-    scheduler = get_scheduler()
-
-    mode_prompts = {
-        "analyze": "你是一位专业的小说编辑。请仔细分析以下文本，指出优点、问题和改进建议。",
-        "polish": "你是一位文字润色专家。请在保持原意和风格的前提下，润色以下文本，使其更加流畅优美。直接输出润色后的文本。",
-        "rewrite": "你是一位创意写手。请根据用户的要求，改写以下文本。",
-        "chat": "你是一位专业的写作助手，帮助用户创作和修改小说。请用中文回答。",
-    }
-
-    system = mode_prompts.get(req.mode, mode_prompts["chat"])
-    user = req.message
-    if req.context:
-        user += f"\n\n【参考文本】\n{req.context[:8000]}"  # Limit context
-
-    async def generate():
-        try:
-            async for token in scheduler.generate_stream(
-                agent_type="writer",
-                system_prompt=system,
-                user_prompt=user,
-            ):
-                yield f"data: {token}\n\n"
-            yield "data: [DONE]\n\n"
-        except Exception as e:
-            logger.error(f"Editor chat error: {e}")
-            yield f"data: [ERROR] {str(e)}\n\n"
-
-    return StreamingResponse(generate(), media_type="text/event-stream")
-
-
-@router.get("/projects/{project_id}/editor/files")
-async def editor_list_files(project_id: str):
-    """List uploaded files for the editor."""
-    proj = _active_projects.get(project_id, {})
-    files = proj.get("uploaded_files", {})
-    return {fid: {"filename": f["filename"], "size": f["size"]} for fid, f in files.items()}
-
-
 @router.delete("/projects/{project_id}/chapters/{chapter_number}")
 async def delete_chapter(project_id: str, chapter_number: int):
     """Delete a chapter and all its artifacts."""
@@ -1115,10 +1452,27 @@ async def edit_section(project_id: str, req: EditSectionRequest):
             ch_num = int(section.split("-")[1])
             from ..models.chapter import PolishedChapter
 
-            existing = fm.load_chapter_markdown(ch_num)
-            title = existing.title if existing else f"第{ch_num}章"
-            updated = PolishedChapter(chapter_number=ch_num, title=title, content=value)
+            task = _active_projects.get(project_id, {}).get("task")
+            if task and not task.done():
+                raise HTTPException(status_code=409, detail="请先保存并暂停，再编辑章节")
+            existing = fm.root / "output" / "chapters" / f"chapter_{ch_num:03d}.md"
+            if existing.exists():
+                import shutil
+                backup = fm.root / "edit_history" / f"chapter_{ch_num:03d}_{uuid.uuid4().hex}.md"
+                backup.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(existing, backup)
+            plan = fm.load_chapter_plan(ch_num)
+            draft = fm.load_chapter_draft(ch_num)
+            title = plan.title if plan else draft.title if draft else f"第{ch_num}章"
+            updated = PolishedChapter(chapter_number=ch_num, title=title, content=value,
+                                      word_count=len(value.replace(" ", "").replace("\n", "")))
             fm.save_chapter_markdown(updated)
+            record = fm.load_workflow_state()
+            if record:
+                state = MainState.model_validate(record["state"])
+                if state.polished_chapter and state.polished_chapter.chapter_number == ch_num:
+                    state.polished_chapter = updated
+                    fm.save_workflow_state(state, record["status"], record["phase"], error=record.get("error"))
             return {"status": "saved", "section": section}
 
         if section.startswith("bible-"):
@@ -1156,6 +1510,8 @@ async def edit_section(project_id: str, req: EditSectionRequest):
                 proj["state"].outline = None
 
         return {"status": "saved", "section": section, "downstream_invalidated": True}
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Edit failed for {section}: {e}")
         raise HTTPException(status_code=500, detail=str(e))

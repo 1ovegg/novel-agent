@@ -1,9 +1,11 @@
 """Model scheduler — routes agent requests to the correct LLM model."""
 
+import asyncio
 import json
 import logging
 import re
 from collections.abc import AsyncGenerator
+from time import perf_counter, time_ns
 from typing import Any
 
 from pydantic import BaseModel, ValidationError
@@ -21,6 +23,21 @@ from .providers import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _validate_structured(response_model, content):
+    try:
+        return response_model.model_validate_json(content)
+    except (ValidationError, ValueError):
+        data = _try_parse_json(content)
+        if not isinstance(data, dict):
+            raise ValueError("Expected a JSON object, not a table, list or text")
+        field_map = _build_field_map(response_model)
+        if len(data) == 1:
+            key = next(iter(data))
+            if key not in response_model.model_fields and key not in field_map and isinstance(data[key], dict):
+                data = data[key]
+        return response_model.model_validate(_coerce_field_types(_translate_keys(data, field_map), response_model))
 
 
 def _try_parse_json(raw: str) -> Any:
@@ -220,6 +237,53 @@ class ModelScheduler:
             for agent_type in self._assignments
         }
         self._settings = settings
+        self._request_slots = asyncio.Semaphore((settings or get_settings()).llm_max_concurrent_requests)
+
+    async def _generate_provider(self, provider, agent_type, **kwargs):
+        from ..api.agent_trace import agent_traces
+
+        queued = perf_counter()
+        record = agent_traces.start(agent_type, kwargs.get("model"), kwargs.get("system_prompt", ""), kwargs.get("user_prompt", ""))
+        try:
+            async with self._request_slots:
+                started = perf_counter()
+                agent_traces.update(record, status="running", queue_seconds=round(started - queued, 2))
+                response = await provider.generate(**kwargs)
+                agent_traces.finish(record, "completed", queued, output=response.content, model=response.model,
+                                    input_tokens=response.input_tokens, output_tokens=response.output_tokens,
+                                    finish_reason=response.finish_reason)
+                logger.info("%s 请求完成：%.1f秒，排队%.1f秒，输出%d token，结束原因%s",
+                            agent_type, perf_counter() - started, started - queued,
+                            response.output_tokens, response.finish_reason or "未知")
+                return response
+        except asyncio.CancelledError:
+            agent_traces.finish(record, "interrupted", queued, error="调用已取消，进度已保留")
+            raise
+        except Exception as exc:
+            agent_traces.finish(record, "failed", queued, error=str(exc))
+            raise
+
+    async def _stream_provider(self, provider, agent_type, **kwargs):
+        from ..api.agent_trace import agent_traces
+
+        started = perf_counter()
+        record = agent_traces.start(agent_type, kwargs.get("model"), kwargs.get("system_prompt", ""), kwargs.get("user_prompt", ""), "running")
+        chunks = []
+        checkpoint = started
+        try:
+            async for token in provider.generate_stream(**kwargs):
+                chunks.append(token)
+                if perf_counter() - checkpoint >= 2:
+                    agent_traces.update(record, output="".join(chunks))
+                    checkpoint = perf_counter()
+                yield token
+            agent_traces.finish(record, "completed", started, output="".join(chunks))
+        except (asyncio.CancelledError, GeneratorExit):
+            agent_traces.finish(record, "interrupted", started, output="".join(chunks), error="流式调用已中断")
+            raise
+        except Exception as exc:
+            agent_traces.finish(record, "failed", started, output="".join(chunks), error=str(exc))
+            raise
 
     # ================================================================
     # Public API
@@ -254,7 +318,7 @@ class ModelScheduler:
         max_tokens = max_tokens_override if max_tokens_override is not None else assignment.max_tokens
 
         try:
-            response = await provider.generate(
+            response = await self._generate_provider(provider, agent_type,
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
                 model=assignment.primary_model,
@@ -271,7 +335,7 @@ class ModelScheduler:
             if assignment.fallback_model:
                 logger.info(f"Retrying with fallback model {assignment.fallback_model}")
                 try:
-                    response = await provider.generate(
+                    response = await self._generate_provider(provider, agent_type,
                         system_prompt=system_prompt,
                         user_prompt=user_prompt,
                         model=assignment.fallback_model,
@@ -303,49 +367,63 @@ class ModelScheduler:
         Shortcut that combines generate() with Pydantic model parsing.
         Includes fallback Chinese→English key translation for local models.
         """
-        response = await self.generate(
-            agent_type=agent_type,
-            system_prompt=system_prompt,
-            user_prompt=user_prompt,
-            response_model=response_model,
-            temperature_override=temperature_override,
-            max_tokens_override=max_tokens_override,
-        )
+        prompt = user_prompt
+        budget = max_tokens_override
+        for attempt in range(2):
+            response = await self.generate(
+                agent_type=agent_type, system_prompt=system_prompt, user_prompt=prompt,
+                response_model=response_model,
+                temperature_override=temperature_override if attempt == 0 else 0.1,
+                max_tokens_override=budget,
+            )
+            try:
+                if response.finish_reason in ("length", "max_tokens"):
+                    raise ValueError("模型输出达到长度上限，被截断")
+                return _validate_structured(response_model, response.content)
+            except (ValidationError, ValueError) as exc:
+                self._save_invalid_output(agent_type, response, exc)
+                if attempt:
+                    self._track_error(agent_type)
+                    reason = (
+                        f"模型输出达到长度上限（{response.output_tokens} token），正文被截断"
+                        if response.finish_reason in ("length", "max_tokens")
+                        else "返回的 JSON 格式不完整或字段不符合要求"
+                    )
+                    raise ValueError(f"{agent_type} {reason}；已重试一次，原始输出已保存到 diagnostics，可从当前步骤继续") from exc
+                if response.finish_reason in ("length", "max_tokens"):
+                    logger.warning("%s 回复达到输出上限被截断（%d token），正在提高预算并精简重试一次",
+                                   agent_type, response.output_tokens)
+                else:
+                    logger.warning("%s 输出格式不符合要求，正在进行一次精简格式重试", agent_type)
+                prompt = (
+                    user_prompt + "\n\n上一次结果无法解析。请重新生成完整且精简的 JSON，不要从中间续写。"
+                    "不使用表格、注释或解释，严格遵循字段结构。错误信息："
+                    + str(exc)[:600] + "\n上次结果片段（仅作纠错参考）：\n" + response.content[:12000]
+                )
+                if response.finish_reason in ("length", "max_tokens"):
+                    budget = min((budget or self._get_assignment(agent_type).max_tokens) * 2, 16384)
 
-        # Layer 1: direct validation
+    def _save_invalid_output(self, agent_type, response, error):
+        from ..api.runtime import project_context
+        settings = self._settings or get_settings()
+        project_id = project_context.get()
+        root = settings.workspace_path
+        if project_id:
+            root = root / "projects" / re.sub(r"[^\w.-]", "_", project_id)
+        payload = {
+            "agent": agent_type, "model": response.model, "finish_reason": response.finish_reason,
+            "output_tokens": response.output_tokens, "error": str(error), "content": response.content,
+        }
+        text = json.dumps(payload, ensure_ascii=False, indent=2)
+        for key in (settings.openai_api_key, settings.anthropic_api_key, settings.openrouter_api_key):
+            if key:
+                text = text.replace(key, "[REDACTED]")
         try:
-            return response_model.model_validate_json(response.content)
-        except (ValidationError, ValueError) as e:
-            logger.debug(f"Direct validation failed, trying Chinese-key fallback: {e}")
-
-        # Layer 2: Chinese→English key translation + type coercion
-        try:
-            data = _try_parse_json(response.content)
-
-            # Guard: structured output must be a JSON object, not a primitive
-            if not isinstance(data, dict):
-                logger.warning(f"LLM returned non-object JSON ({type(data).__name__}): {str(data)[:200]}")
-                raise ValueError(f"Expected JSON object, got {type(data).__name__}")
-
-            cn_to_en = _build_field_map(response_model)
-
-            # Unwrap nested wrapper objects like {"世界观设定": {...}}
-            if isinstance(data, dict) and len(data) == 1:
-                sole_key = next(iter(data))
-                sole_val = data[sole_key]
-                if sole_key not in cn_to_en and isinstance(sole_val, dict):
-                    logger.debug(f"Unwrapping nested key '{sole_key}'")
-                    data = sole_val
-
-            translated = _translate_keys(data, cn_to_en)
-            logger.debug(f"Translated keys: {list(translated.keys())}")
-            coerced = _coerce_field_types(translated, response_model)
-            return response_model.model_validate(coerced)
-        except (ValidationError, ValueError):
-            raise  # Fallback also failed, let the original error propagate
-        except Exception as fallback_err:
-            logger.error(f"Fallback processing error: {fallback_err}", exc_info=True)
-            raise  # Re-raise original validation error
+            folder = root / "diagnostics"
+            folder.mkdir(parents=True, exist_ok=True)
+            (folder / f"{agent_type}_{time_ns()}.json").write_text(text, encoding="utf-8")
+        except OSError:
+            logger.warning("无法保存模型格式错误诊断文件")
 
     async def generate_stream(
         self,
@@ -366,7 +444,7 @@ class ModelScheduler:
         max_tokens = max_tokens_override if max_tokens_override is not None else assignment.max_tokens
 
         try:
-            async for token in provider.generate_stream(
+            async for token in self._stream_provider(provider, agent_type,
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
                 model=assignment.primary_model,
@@ -377,7 +455,7 @@ class ModelScheduler:
         except Exception as e:
             logger.warning(f"Primary model stream failed for {agent_type}: {e}")
             if assignment.fallback_model:
-                async for token in provider.generate_stream(
+                async for token in self._stream_provider(provider, agent_type,
                     system_prompt=system_prompt,
                     user_prompt=user_prompt,
                     model=assignment.fallback_model,
@@ -434,7 +512,8 @@ class ModelScheduler:
         elif provider_name == "openai":
             if not settings.has_openai:
                 raise ValueError("OPENAI_API_KEY not configured")
-            kwargs = {"api_key": settings.openai_api_key}
+            kwargs = {"api_key": settings.openai_api_key, "trust_env": settings.openai_trust_env,
+                      "thinking_enabled": settings.openai_thinking_enabled}
             if settings.openai_base_url:
                 kwargs["base_url"] = settings.openai_base_url
             return OpenAIProvider(**kwargs)
@@ -445,7 +524,8 @@ class ModelScheduler:
                 raise ValueError(
                     f"OPENAI_API_KEY not configured for {provider_name}. Set OPENAI_API_KEY and OPENAI_BASE_URL in .env"
                 )
-            kwargs = {"api_key": settings.openai_api_key}
+            kwargs = {"api_key": settings.openai_api_key, "trust_env": settings.openai_trust_env,
+                      "thinking_enabled": settings.openai_thinking_enabled}
             if settings.openai_base_url:
                 kwargs["base_url"] = settings.openai_base_url
             return OpenAIProvider(**kwargs)
@@ -456,12 +536,14 @@ class ModelScheduler:
             return OpenAIProvider(
                 api_key=settings.openrouter_api_key,
                 base_url=settings.openrouter_base_url,
+                trust_env=settings.openai_trust_env,
             )
 
         elif provider_name == "ollama":
             return OpenAIProvider(
                 api_key="ollama",  # Not used but required by OpenAI client
                 base_url=f"{settings.ollama_base_url}/v1",
+                trust_env=settings.openai_trust_env,
             )
 
         else:

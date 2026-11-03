@@ -10,7 +10,14 @@ from ..models.bible import NovelBible
 from ..models.common import AgentLogEntry
 from ..models.review import Issue, ReviewReport
 from ..models.state import MainState
-from ..models.topic import CandidateTopic, ScanReport, TitleSynopsisReport, TopicResearchState
+from ..models.topic import (
+    BenchmarkReport,
+    CandidateTopic,
+    CrossPlatformReport,
+    ScanReport,
+    TitleSynopsisReport,
+    TopicResearchState,
+)
 from ..storage.bible_markdown import BibleMarkdownStore
 from .architect import ArchitectAgent
 from .chapter_inspector import ChapterInspector
@@ -47,12 +54,12 @@ def _build_topic_context(state: "MainState") -> tuple[str, list[str]]:
             parts.append(f"【小事件闭环大纲 — {genre_name}】")
             parts.append(f"闭环总目标：{outline.arc_goal}")
             parts.append(f"总字数：{outline.total_words}")
-            parts.append("10章节奏骨架：")
+            parts.append(f"{len(outline.chapters)}章节奏骨架：")
             for ch in (outline.chapters or [])[:5]:
                 parts.append(
                     f"  第{ch.chapter_number}章 | 目标：{ch.goal} | 冲突：{ch.conflict} | 爽点：{ch.pleasure_point}"
                 )
-            if outline.chapters and len(outline.chapters) >= 10:
+            if outline.chapters and len(outline.chapters) > 5:
                 last = outline.chapters[-1]
                 parts.append(
                     f"  ... → 第{last.chapter_number}章(终章) | 目标：{last.goal} | 爽点：{last.pleasure_point}"
@@ -244,6 +251,19 @@ class OrchestratorAgent:
         """
         logger.info("Phase 0b: Selecting topic...")
         state.current_phase = "topic_selection"
+        config = state.project_config
+        if config and config.topic_source == "rankings":
+            from ..api.daily_rankings import get_daily_rankings
+            from .topic_preparation import research_from_cards
+            cached = get_daily_rankings().snapshot()
+            if not cached.get("topic_cards"):
+                raise ValueError("今日选题仍在预生成或准备失败，请查看今日选题状态；也可返回自主创作")
+            state.topic_research = research_from_cards(cached["topic_cards"],cached["platforms"])
+            logger.info("直接复用%s的%d张选题卡及简介，没有重新调用模型",cached["date"],len(cached["topic_cards"]))
+            return state
+        if config and config.topic_source == "manual" and config.target_chapter_count:
+            from .topic_preparation import prepare_manual_topics
+            return await prepare_manual_topics(self.topic_scout,state,getattr(self,"topic_checkpoint",None))
 
         research = state.topic_research
         if research is None:
@@ -252,11 +272,16 @@ class OrchestratorAgent:
         feilu = research.feilu_scan or None
         fanqie = research.fanqie_scan or None
 
-        # Step 1C: Cross-platform comparison
-        cross = await self.topic_scout.cross_platform_analysis(
-            feilu=feilu,
-            fanqie=fanqie,
-        )
+        # Manual research starts directly from the author's direction; no scan is required.
+        manual = state.project_config and state.project_config.topic_source == "manual"
+        if manual:
+            direction = state.project_config.topic_type or "、".join(state.project_config.genre)
+            cross = CrossPlatformReport(selected_directions=[direction])
+            logger.info("按用户指定题材研究: %s", direction)
+        else:
+            cross = await self.topic_scout.cross_platform_analysis(feilu=feilu, fanqie=fanqie)
+            if state.project_config and state.project_config.topic_type:
+                cross.selected_directions = [state.project_config.topic_type]
         research.cross_platform = cross
         state.agent_log.append(
             AgentLogEntry(
@@ -280,11 +305,15 @@ class OrchestratorAgent:
             effective_directions = [generic, "玄幻修仙", "系统流", "重生逆袭"]
 
         # Step 2: Benchmark book skeleton analysis
-        benchmarks = await self.topic_scout.analyze_benchmarks(
-            directions=effective_directions,
-            feilu_scan=feilu,
-            fanqie_scan=fanqie,
-        )
+        if manual:
+            benchmarks = BenchmarkReport(structural_summary=(
+                f"用户自选题材：{direction}。创作要求：{state.project_config.inspiration}。"
+                "请严格围绕指定类型提出不同故事方案；没有使用榜单或真实对标书数据。"
+            ))
+        else:
+            benchmarks = await self.topic_scout.analyze_benchmarks(
+                directions=effective_directions, feilu_scan=feilu, fanqie_scan=fanqie,
+            )
         research.benchmarks = benchmarks
         state.agent_log.append(
             AgentLogEntry(
@@ -309,6 +338,8 @@ class OrchestratorAgent:
         )
 
         if not candidates.topics:
+            if state.project_config and state.project_config.topic_source:
+                raise RuntimeError("模型未返回有效候选题材，请检查模型连接或输出格式后重试")
             logger.warning("No candidate topics generated — building fallback topics")
             fallback_topics = []
             for direction in effective_directions[:8]:
@@ -463,7 +494,11 @@ class OrchestratorAgent:
                 )
             ]
 
-        outline = await self.topic_scout.plan_mini_arc(
+        if state.project_config and state.project_config.target_chapter_count:
+            from .topic_preparation import prepare_sized_arc
+            outline = await prepare_sized_arc(self.topic_scout,state,genre,matching[0],title_report,getattr(self,"topic_checkpoint",None))
+        else:
+            outline = await self.topic_scout.plan_mini_arc(
             genre_name=genre,
             topic=matching[0],
             title_report=title_report,
@@ -610,6 +645,9 @@ class OrchestratorAgent:
             narrative_constraints=constraints,
         )
         state.bible = bible
+        if config.target_chapter_count:
+            average = config.chapter_word_target(1)
+            state.bible.rules.chapter_length_range = (int(average*.85),int(average*1.15))
         # Persist enriched config so downstream phases (characters, outline)
         # get the topic research context too
         state.project_config = config
@@ -635,9 +673,18 @@ class OrchestratorAgent:
         logger.info("Phase 2b: Creating characters...")
         state.current_phase = "character_creation"
 
+        async def checkpoint(registry, progress, message):
+            state.characters = registry
+            state.character_creation_progress = progress
+            state.agent_log.append(AgentLogEntry(agent="character_manager", phase="character_creation", summary=message))
+            callback = getattr(self, "character_checkpoint", None)
+            if callback:
+                await callback(state, message)
+
+        topic_context, _ = _build_topic_context(state)
         characters = await self.character_manager.create_all_characters(
-            state.project_config,
-            state.bible,
+            state.project_config, state.bible, registry=state.characters,
+            progress=state.character_creation_progress, checkpoint=checkpoint, story_context=topic_context,
         )
         state.characters = characters
         state.agent_log.append(
@@ -697,6 +744,11 @@ class OrchestratorAgent:
         # Sync character states before planning
         state.sync_character_states()
 
+        following = getattr(self, "chapter_followup_context", None)
+        continuity = (
+            f"补全缺失的第{chapter_num}章；第{chapter_num + 1}章已有定稿且需保留，"
+            "本章应衔接它的开头，不提前复述后续事件。后续章节开头：\n" + following[:1200]
+        ) if following else ""
         plan = await self.plot_planner.plan_chapter(
             chapter_number=chapter_num,
             config=state.project_config,
@@ -704,9 +756,9 @@ class OrchestratorAgent:
             characters=state.characters,
             outline=state.outline,
             memory=state.memory,
+            continuity_context=continuity,
         )
         state.chapter_plan = plan
-        state.current_chapter_number = chapter_num
 
         state.agent_log.append(
             AgentLogEntry(
@@ -729,7 +781,7 @@ class OrchestratorAgent:
         dialogue ratio, paragraph density, hook presence, AI markers) before
         the expensive LLM review phase.
         """
-        logger.info(f"Phase 5: Writing chapter {state.current_chapter_number}...")
+        logger.info(f"Phase 5: Writing chapter {state.current_chapter_number + 1}...")
         state.current_phase = "chapter_writing"
 
         revision_feedback = state.human_feedback if state.human_decision == "revise" else None
@@ -750,16 +802,42 @@ class OrchestratorAgent:
             except Exception as e:
                 logger.warning(f"RAG retrieval failed: {e}")
 
-        draft = await self.writer.generate_chapter(
-            chapter_plan=state.chapter_plan,
-            config=state.project_config,
-            bible=state.bible,
-            characters=state.characters,
-            outline=state.outline,
-            memory=state.memory,
-            revision_feedback=revision_feedback,
-            rag_context=rag_context,
+        import hashlib
+        import json
+
+        fingerprint = hashlib.sha256(json.dumps([
+            state.chapter_plan.model_dump(mode="json"), state.project_config.model_dump(mode="json"),
+            revision_feedback, state.review_iteration,
+        ], ensure_ascii=False).encode("utf-8")).hexdigest()
+
+        async def checkpoint(message):
+            callback = getattr(self, "writer_checkpoint", None)
+            if callback:
+                await callback(state, message)
+
+        can_reuse = (
+            state.writing_progress.get("fingerprint") == fingerprint
+            and state.chapter_draft is not None
+            and state.chapter_draft.chapter_number == state.chapter_plan.chapter_number
+            and bool(state.chapter_draft.content.strip())
         )
+        if not can_reuse:
+            state.chapter_draft = None
+            state.writing_progress = {"fingerprint": fingerprint, "extraction": {}}
+            state.polish_progress = {}
+            draft = await self.writer.generate_chapter(
+                chapter_plan=state.chapter_plan, config=state.project_config,
+                bible=state.bible, characters=state.characters,
+                outline=state.outline, memory=state.memory,
+                revision_feedback=revision_feedback, rag_context=rag_context,
+            )
+            if draft.chapter_number != state.chapter_plan.chapter_number or not draft.content.strip():
+                raise ValueError("写作结果章节号不匹配或正文为空，未覆盖已有初稿")
+            state.chapter_draft = draft
+            await checkpoint(f"第{draft.chapter_number}章初稿已保存（{draft.word_count}字），开始提取事实")
+        else:
+            draft = state.chapter_draft
+            await checkpoint(f"已恢复第{draft.chapter_number}章初稿，继续提取事实，不重新写作")
 
         # Extract facts and state changes (with contradiction detection)
         draft = await self.writer.extract_facts_and_changes(
@@ -767,6 +845,8 @@ class OrchestratorAgent:
             bible=state.bible,
             characters=state.characters,
             memory=state.memory,
+            progress=state.writing_progress.setdefault("extraction", {}),
+            checkpoint=checkpoint,
         )
 
         # ── Structural inspection (deterministic, no LLM cost) ──
@@ -827,7 +907,7 @@ class OrchestratorAgent:
         1. Standard review: Editor + ContinuityChecker + ReaderSimulator (parallel)
         2. Adversarial review: Independent ReviewerAgent with fresh perspective
         """
-        logger.info(f"Phase 6: Reviewing chapter {state.current_chapter_number}...")
+        logger.info(f"Phase 6: Reviewing chapter {state.current_chapter_number + 1}...")
         state.current_phase = "quality_review"
         state.review_iteration += 1
 
@@ -873,6 +953,15 @@ class OrchestratorAgent:
             )
 
             report = results[0] if not isinstance(results[0], Exception) else None
+            failed_checks = [name for name, result in zip(
+                ("editor", "timeline", "characters", "causality", "reader_simulator", "reviewer"), results,
+            ) if isinstance(result, Exception)]
+            if failed_checks:
+                logger.warning("第%s章部分审核未完成：%s；保留已完成检查，继续润色，不标记审核通过",
+                               state.chapter_draft.chapter_number, ", ".join(failed_checks))
+            if report is None:
+                report = ReviewReport(chapter_number=state.chapter_draft.chapter_number, overall_score=0,
+                                      review_complete=False, failed_checks=failed_checks, passed=False)
             timeline_issues = results[1] if not isinstance(results[1], Exception) else []
             char_issues = results[2] if not isinstance(results[2], Exception) else []
             causality_issues = results[3] if not isinstance(results[3], Exception) else []
@@ -939,6 +1028,9 @@ class OrchestratorAgent:
                     report.passed = avg >= 6.5 and not report.has_critical
                     report.overall_score = avg
 
+                report.review_complete = not failed_checks
+                report.failed_checks = failed_checks
+                report.passed = report.passed and report.review_complete
                 state.review_report = report
         else:
             # Subsequent iterations: lighter review focused on remaining issues
@@ -978,14 +1070,21 @@ class OrchestratorAgent:
 
     async def polish_chapter(self, state: MainState) -> MainState:
         """Polish and refine the chapter draft."""
-        logger.info(f"Phase 7: Polishing chapter {state.current_chapter_number}...")
+        logger.info(f"Phase 7: Polishing chapter {state.current_chapter_number + 1}...")
         state.current_phase = "polish_revision"
+
+        async def checkpoint(message):
+            callback = getattr(self, "polish_checkpoint", None)
+            if callback:
+                await callback(state, message)
 
         polished = await self.refiner.polish_chapter(
             draft=state.chapter_draft,
             review=state.review_report if state.review_report else ReviewReport(),
             bible=state.bible,
             human_feedback=state.human_feedback,
+            progress=state.polish_progress,
+            checkpoint=checkpoint,
         )
 
         state.polished_chapter = polished
@@ -1008,6 +1107,20 @@ class OrchestratorAgent:
 
         Returns None if RAG dependencies are not installed.
         """
+        if getattr(self, "_rag_unavailable", False):
+            return None
+        from importlib.util import find_spec
+
+        from ..config.settings import get_settings
+        settings = getattr(self.scheduler, "_settings", None) or get_settings()
+        if not settings.rag_enabled:
+            self._rag_unavailable = True
+            return None
+        missing = [module for module in ("sentence_transformers", "chromadb") if find_spec(module) is None]
+        if missing:
+            self._rag_unavailable = True
+            logger.info("可选语义检索未启用（缺少%s）；继续使用章节摘要、事实和角色记忆", ", ".join(missing))
+            return None
         pid = project_id or self._rag_project_id or "default"
         if self._rag is not None and self._rag_project_id == pid:
             return self._rag
@@ -1020,7 +1133,7 @@ class OrchestratorAgent:
             logger.debug("RAG dependencies not available — semantic search disabled")
             return None
 
-        persist_dir = Path("workspace/projects") / pid / "rag"
+        persist_dir = Path(settings.workspace_path) / "projects" / pid / "rag"
         persist_dir.mkdir(parents=True, exist_ok=True)
         try:
             self._rag = NovelRAG(str(persist_dir))
@@ -1030,6 +1143,7 @@ class OrchestratorAgent:
         except Exception as e:
             logger.warning(f"Failed to initialize RAG: {e} — continuing without semantic search")
             self._rag = None
+            self._rag_unavailable = True
             return None
 
     async def _rag_index_chapter(self, state: MainState, project_id: str | None = None) -> None:
@@ -1039,7 +1153,7 @@ class OrchestratorAgent:
             return
         try:
             await rag.index_chapter(
-                chapter_num=state.current_chapter_number,
+                chapter_num=state.polished_chapter.chapter_number,
                 summary=state.memory.short_term.current_chapter_summary if state.memory else "",
                 facts=list(state.memory.long_term.facts.values()) if state.memory else [],
                 timeline_events=state.memory.timeline if state.memory else [],
@@ -1054,7 +1168,7 @@ class OrchestratorAgent:
 
     async def update_memory(self, state: MainState) -> MainState:
         """Update all memory artifacts."""
-        logger.info(f"Phase 8: Updating memory for chapter {state.current_chapter_number}...")
+        logger.info(f"Phase 8: Updating memory for chapter {state.current_chapter_number + 1}...")
         state.current_phase = "memory_update"
 
         memory = await self.memory_manager.update_memory(
@@ -1078,7 +1192,7 @@ class OrchestratorAgent:
         # ── Periodic hierarchical consolidation ──
         state.memory = await self.memory_manager.consolidate_periodically(
             memory=state.memory,
-            chapter_num=state.current_chapter_number,
+            chapter_num=state.polished_chapter.chapter_number,
         )
 
         # ── RAG indexing (non-blocking, graceful fallback) ──

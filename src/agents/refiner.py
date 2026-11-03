@@ -1,6 +1,10 @@
 """Refiner Agent — polishes chapter drafts based on review feedback."""
 
+import hashlib
+import json
 import logging
+import re
+from collections.abc import Awaitable, Callable
 
 from pydantic import BaseModel, Field
 
@@ -18,6 +22,21 @@ class PolishedOutput(BaseModel):
     title: str = Field(default="")
     content: str = Field(..., description="润色后的章节正文")
     revision_notes: str = Field(default="", description="修改说明")
+
+
+def _split_passages(content: str, limit: int = 900) -> list[str]:
+    """Keep every source character, preferring paragraph and sentence boundaries."""
+    chunks = []
+    while content:
+        end = min(limit, len(content))
+        if end < len(content):
+            boundaries = list(re.finditer(r"\n|[。！？]", content[:end]))
+            candidates = [match.end() for match in boundaries if match.end() >= limit // 2]
+            if candidates:
+                end = candidates[-1]
+        chunks.append(content[:end])
+        content = content[end:]
+    return chunks
 
 
 class RefinerAgent(BaseAgent):
@@ -40,6 +59,8 @@ class RefinerAgent(BaseAgent):
         review: ReviewReport,
         bible: NovelBible,
         human_feedback: str | None = None,
+        progress: dict | None = None,
+        checkpoint: Callable[[str], Awaitable[None]] | None = None,
     ) -> PolishedChapter:
         """Polish a chapter draft based on review feedback.
 
@@ -116,12 +137,48 @@ class RefinerAgent(BaseAgent):
             human_feedback=human_feedback,
         )
 
-        result = await self.generate_structured(
-            system_prompt=system,
-            user_prompt=user,
-            response_model=PolishedOutput,
-            temperature_override=0.4,
-            max_tokens_override=8192,
+        progress = progress if progress is not None else {}
+        chunk_size = progress.get("chunk_size", 900 if progress.get("parts") else 1200)
+        passages = _split_passages(draft.content, limit=chunk_size)
+        if not passages or not draft.content.strip():
+            raise ValueError("章节初稿为空，无法润色")
+        # Include feedback/style in the key so edits invalidate obsolete partial work.
+        fingerprint = hashlib.sha256(json.dumps(
+            [draft.chapter_number, system, user, passages], ensure_ascii=False,
+        ).encode("utf-8")).hexdigest()
+        if progress.get("fingerprint") != fingerprint:
+            progress.clear()
+            progress.update(fingerprint=fingerprint, parts=[], total=len(passages), chunk_size=chunk_size)
+        parts = progress["parts"]
+        for index in range(len(parts), len(passages)):
+            if checkpoint:
+                await checkpoint(f"第{draft.chapter_number}章润色 {index + 1}/{len(passages)} 段，已保存 {len(parts)} 段")
+            # The template's full draft is context only; the output covers this passage.
+            nearby = (
+                "【前段参考】" + (passages[index-1][-250:] if index else "本章开头")
+                + "\n【本段原文】" + passages[index]
+                + "\n【后段参考】" + (passages[index+1][:250] if index+1<len(passages) else "本章结尾")
+            )
+            section_prompt = (
+                user.replace(draft.content, nearby) + f"\n\n【本次分段润色：{index + 1}/{len(passages)}】\n"
+                "上下相邻段落仅作衔接参考。本次只修改下方指定原文，不要输出整章、分析过程或新增情节。"
+                "保持人物、事件顺序和段落衔接，正文长度控制在指定原文的80%至120%。"
+                "title沿用原标题，revision_notes不超过50字。只有最后一段可以调整章末钩子。\n"
+                f"【本次指定原文开始】\n{passages[index]}\n【本次指定原文结束】"
+            )
+            part = await self.generate_structured(
+                system_prompt=system, user_prompt=section_prompt, response_model=PolishedOutput,
+                temperature_override=0.4, max_tokens_override=8192,
+            )
+            if not part.content.strip():
+                raise ValueError(f"第{index + 1}段润色正文为空，已保存此前段落，可继续重试")
+            parts.append(part.model_dump())
+            if checkpoint:
+                await checkpoint(f"第{draft.chapter_number}章润色已保存 {len(parts)}/{len(passages)} 段")
+        result = PolishedOutput(
+            title=draft.title,
+            content="\n\n".join(part["content"].strip() for part in parts),
+            revision_notes="\n".join(part["revision_notes"] for part in parts if part["revision_notes"]),
         )
 
         word_count = len(result.content.replace(" ", "").replace("\n", ""))

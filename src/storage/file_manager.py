@@ -313,6 +313,33 @@ class ProjectFileManager:
         topic_dir = self.root / "topic_research"
         YamlSerializer.to_yaml(outlines, topic_dir / "mini_arc_outlines.yaml")
 
+    def save_topic_research(self, research) -> None:
+        YamlSerializer.to_yaml(research, self.root / "topic_research" / "research.yaml")
+
+    def load_topic_research(self):
+        from ..models.topic import TopicResearchState
+        path = self.root / "topic_research" / "research.yaml"
+        return YamlSerializer.from_yaml(path, TopicResearchState) if path.exists() else None
+
+    def save_workflow_state(self, state, status, phase, error=None):
+        from ..api.runtime import now_iso
+        from ..models.common import WorkflowPhase
+        self.root.mkdir(parents=True, exist_ok=True)
+        path = self.root / "workflow_state.json"
+        temporary = path.with_suffix(".tmp")
+        normalized = state.model_copy(update={"current_phase": WorkflowPhase(state.current_phase)})
+        temporary.write_text(json.dumps({
+            "state": normalized.model_dump(mode="json"), "status": status,
+            "phase": str(phase), "updated_at": now_iso(), "error": error,
+        }, ensure_ascii=False), encoding="utf-8")
+        temporary.replace(path)
+
+    def load_workflow_state(self):
+        path = self.root / "workflow_state.json"
+        if not path.exists():
+            return None
+        return json.loads(path.read_text(encoding="utf-8"))
+
     def load_mini_arc_outlines(self) -> dict | None:
         """Load saved mini-arc outlines."""
         path = self.root / "topic_research" / "mini_arc_outlines.yaml"

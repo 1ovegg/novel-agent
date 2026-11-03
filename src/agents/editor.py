@@ -73,6 +73,11 @@ class EditorAgent(BaseAgent):
         """Run all quality checks and produce a review report."""
         logger.info(f"Reviewing chapter {draft.chapter_number}...")
 
+        from ..config.settings import get_settings
+        settings = getattr(self.scheduler, "_settings", None) or get_settings()
+        if settings.editor_review_mode == "combined":
+            return await self._combined_review(draft, chapter_plan, bible, characters, memory)
+
         # Run checks (could be parallel, but sequential is simpler for MVP)
         consistency_issues = await self.check_consistency(draft, bible, characters, memory)
         pacing_issues = await self.check_pacing(draft, chapter_plan)
@@ -166,6 +171,40 @@ class EditorAgent(BaseAgent):
             f"passed={report.passed}, issues={len(report.issues)}"
         )
         return report
+
+    async def _combined_review(self, draft, chapter_plan, bible, characters, memory):
+        """Inspect all six dimensions in one response, avoiding four duplicate passes."""
+        facts = list(memory.long_term.facts.values())[-30:] if memory else []
+        system = self.build_system_prompt(
+            role="综合小说编辑", expertise="同时检查设定一致性、人物行为、节奏、章末钩子、文风与AI套路表达。",
+        )
+        user = f"""综合审核第{draft.chapter_number}章，覆盖六个维度，不拆成多份报告。
+【章节目标】{chapter_plan.goal}
+【预期钩子】{chapter_plan.ending_hook}
+【文风】{bible.style_contract.model_dump_json()}
+【世界规则】{bible.rules.model_dump_json()}
+【角色】{self._format_character_briefs(characters)}
+【最近已知事实】{[fact.description for fact in facts]}
+【章节正文】
+{draft.content}
+
+dimension_scores必须包含consistency、character、pacing、hook、style、ai_flavor，均为0至10数字。
+overall_score为总体评分；issues最多8条，每条指出位置、严重性、具体问题和修正建议，各字段不超过60字。
+strengths最多3条，suggestions最多4条，每条不超过60字。只返回精简JSON，不重写或复述正文。"""
+        result = await self.generate_structured(
+            system_prompt=system, user_prompt=user, response_model=ReviewOutput,
+            temperature_override=0.3, max_tokens_override=8192,
+        )
+        required = {"consistency", "character", "pacing", "hook", "style", "ai_flavor"}
+        if not required.issubset(result.dimension_scores):
+            raise ValueError("综合审核缺少必要维度评分，未将其视为审核通过")
+        return ReviewReport(
+            chapter_number=draft.chapter_number, overall_score=result.overall_score,
+            dimension_scores=result.dimension_scores, issues=result.issues,
+            strengths=result.strengths, suggestions=result.suggestions,
+            passed=sum(result.dimension_scores.values()) / len(result.dimension_scores) >= 6.5
+                   and not any(issue.severity == "critical" for issue in result.issues),
+        )
 
     # ================================================================
     # Individual check methods

@@ -73,11 +73,11 @@ class ContinuityCheckerAgent(BaseAgent):
         )
 
         result = await self.generate_structured(
-            system_prompt=system,
+            system_prompt=system + "\n只列出最多6条关键问题，每条描述和建议不超过60字，无问题返回空数组，不复述正文。",
             user_prompt=user,
             response_model=ContinuityOutput,
             temperature_override=0.3,
-            max_tokens_override=2048,
+            max_tokens_override=8192,
         )
         return result.issues
 
@@ -132,11 +132,11 @@ class ContinuityCheckerAgent(BaseAgent):
         )
 
         result = await self.generate_structured(
-            system_prompt=system,
+            system_prompt=system + "\n只列出最多6条关键问题，每条描述和建议不超过60字，无问题返回空数组，不复述正文。",
             user_prompt=user,
             response_model=ContinuityOutput,
             temperature_override=0.3,
-            max_tokens_override=2048,
+            max_tokens_override=8192,
         )
         return result.issues
 
@@ -182,11 +182,11 @@ class ContinuityCheckerAgent(BaseAgent):
         )
 
         result = await self.generate_structured(
-            system_prompt=system,
+            system_prompt=system + "\n只列出最多6条关键问题，每条描述和建议不超过60字，无问题返回空数组，不复述正文。",
             user_prompt=user,
             response_model=ContinuityOutput,
             temperature_override=0.3,
-            max_tokens_override=2048,
+            max_tokens_override=8192,
         )
         return result.issues
 
@@ -239,10 +239,10 @@ class ContinuityCheckerAgent(BaseAgent):
         )
 
         result = await self.generate_structured(
-            system_prompt=system,
+            system_prompt=system + "\n只列出最多6条关键问题，每条描述和建议不超过60字，无问题返回空数组，不复述正文。",
             user_prompt=user,
             response_model=ContinuityOutput,
             temperature_override=0.3,
-            max_tokens_override=2048,
+            max_tokens_override=8192,
         )
         return result.issues

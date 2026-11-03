@@ -14,7 +14,9 @@ Examples:
 """
 
 from pathlib import Path
+from typing import Literal
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # ---------------------------------------------------------------------------
@@ -73,6 +75,8 @@ class Settings(BaseSettings):
     openrouter_api_key: str = ""
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
     openai_base_url: str = ""  # Override for OpenAI-compatible APIs (ModelScope, DashScope, etc.)
+    openai_trust_env: bool = True  # Use HTTP(S)_PROXY; disable for direct campus-network access.
+    openai_thinking_enabled: bool | None = None  # Optional DeepSeek thinking toggle; None keeps server default.
     ollama_base_url: str = "http://localhost:11434"
 
     # --- Default Model Configuration ---
@@ -114,6 +118,9 @@ class Settings(BaseSettings):
     # --- Chapter Defaults ---
     default_chapter_word_count: int = 3000
     max_review_iterations: int = 3
+    llm_max_concurrent_requests: int = Field(default=3, ge=1, le=16)
+    editor_review_mode: Literal["combined", "detailed"] = "combined"
+    rag_enabled: bool = True  # Automatically disabled when optional dependencies are absent.
     min_review_score_accept: float = 6.5
 
     # --- Retrieval ---

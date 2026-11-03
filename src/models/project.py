@@ -1,14 +1,18 @@
 """Project configuration and metadata models."""
 
 from datetime import datetime
+from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from .common import LengthCategory, ProjectStatus, WorkflowPhase
 
 
 class ProjectConfig(BaseModel):
     """User-provided project configuration (Phase 1 input)."""
+
+    topic_source: Literal["manual", "rankings"] | None = None
+    topic_type: str = Field(default="", max_length=200)
 
     # --- Core identity ---
     title: str = Field(
@@ -39,10 +43,24 @@ class ProjectConfig(BaseModel):
     )
     target_word_count: int = Field(
         default=80000,
-        ge=5000,
+        ge=1000,
         le=500000,
         description="Target total word count",
     )
+    target_chapter_count: int | None = Field(default=None, ge=1, le=200)
+
+    @model_validator(mode="after")
+    def validate_size(self):
+        if self.target_chapter_count and self.target_word_count < self.target_chapter_count * 300:
+            raise ValueError("平均每章至少300字，请减少章节数或增加总字数")
+        if self.target_chapter_count:
+            self.target_length = LengthCategory.SHORT_STORY if self.target_word_count <= 10000 else LengthCategory.NOVELLA if self.target_word_count < 40000 else LengthCategory.NOVEL if self.target_word_count <= 100000 else LengthCategory.EPIC
+        return self
+
+    def chapter_word_target(self, number: int) -> int:
+        count = self.target_chapter_count or max(10, self.target_word_count // 4000)
+        average, remainder = divmod(self.target_word_count, count)
+        return average + (1 if number <= remainder else 0)
 
     # --- Style & tone ---
     tone: str = Field(
@@ -71,6 +89,12 @@ class ProjectConfig(BaseModel):
 
 class ProjectMeta(BaseModel):
     """Runtime project metadata tracked across the workflow."""
+
+    @field_validator("created_at", "updated_at", mode="before")
+    @classmethod
+    def normalize_timestamp(cls, value):
+        # Older workspace YAML can contain a timestamp object instead of a string.
+        return value.isoformat() if isinstance(value, datetime) else value
 
     project_id: str = Field(..., description="Unique project identifier")
     title: str | None = Field(default=None, description="Novel title (can be set later)")

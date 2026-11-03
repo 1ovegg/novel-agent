@@ -168,64 +168,40 @@ def _coerce_field_types(data: dict, response_model: type[BaseModel]) -> dict:
 
 
 def _build_chinese_schema_prompt(response_model: type[BaseModel]) -> str:
-    """Build a Chinese-language schema description for local models.
+    """Show a valid nested JSON example, including object arrays and mappings."""
+    schema = response_model.model_json_schema()
 
-    Instead of dumping raw JSON Schema (which confuses Chinese-native models
-    with its English field names + Chinese descriptions), we build an explicit
-    template showing exactly what keys to use.
-    """
-    lines = [
-        "请严格按照以下 JSON 格式输出，**字段名必须使用英文**（括号内为中文说明），不要使用中文作为 JSON key：",
-        "",
-        "```json",
-        "{",
-    ]
+    def example(node, depth=0):
+        if depth > 7:
+            return None
+        if "$ref" in node:
+            name = node["$ref"].rsplit("/", 1)[-1]
+            return example(schema.get("$defs", {}).get(name, {}), depth + 1)
+        if "anyOf" in node:
+            return example(next((item for item in node["anyOf"] if item.get("type") != "null"), {}), depth + 1)
+        if node.get("enum"):
+            return node["enum"][0]
+        kind = node.get("type")
+        if kind == "object":
+            if node.get("properties"):
+                return {name: example(field, depth + 1) for name, field in node["properties"].items()}
+            additional = node.get("additionalProperties")
+            return {"character_id": example(additional, depth + 1)} if isinstance(additional, dict) and additional else {}
+        if kind == "array":
+            return [example(node.get("items", {}), depth + 1)]
+        if "default" in node and node["default"] is not None:
+            return node["default"]
+        return {"string": "字段内容", "integer": 0, "number": 0.0, "boolean": False}.get(kind)
 
-    for name, field in response_model.model_fields.items():
-        desc = field.description or name
-        ann = field.annotation
-
-        # Determine a sample value based on the field type
-        if ann is str:
-            sample = '"..."'
-        elif ann is int:
-            sample = "0"
-        elif ann is float:
-            sample = "0.0"
-        elif ann is bool:
-            sample = "false"
-        elif ann is not None:
-            origin = getattr(ann, "__origin__", None)
-            args = getattr(ann, "__args__", ())
-            if origin is list:
-                sample = '["..."]'
-            elif origin is dict:
-                sample = "{}"
-            elif type(None) in args:
-                sample = "null"
-            else:
-                sample = '"..."'
-        else:
-            sample = '"..."'
-
-        required = field.is_required()
-        required_note = " (required)" if required else ""
-        comma = ","
-        lines.append(f'  "{name}": {sample}{comma}  # {desc}{required_note}')
-
-    lines.extend(
-        [
-            "}",
-            "```",
-            "",
-            "**重要提醒**：",
-            "- JSON 的 key 必须使用英文（如上面的 name, world_type），绝对不能使用中文作为 key",
-            "- 值的内容用中文",
-            "- 不要在上面的 JSON 中添加注释（// 或 # 等），输出必须是纯 JSON",
-        ]
+    return (
+        "请只返回完整、合法的 JSON 对象。字段名必须为英文，值可以用中文。\n"
+        "数组里的对象必须保持对象结构，不能改成字符串、Markdown 表格或文字段落。\n"
+        "以下是结构示例（请按任务填写真实内容，不要照抄示例值）：\n```json\n"
+        + json.dumps(example(schema), ensure_ascii=False, indent=2)
+        + "\n```\n完整字段约束：\n"
+        + json.dumps(schema, ensure_ascii=False, separators=(",", ":"))
+        + "\n不要输出注释、解释、代码围栏或省略号；必须闭合所有字符串、数组和对象。"
     )
-
-    return "\n".join(lines)
 
 
 class AnthropicProvider(BaseLLMProvider):
@@ -281,6 +257,7 @@ class AnthropicProvider(BaseLLMProvider):
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             cost=cost,
+            finish_reason=getattr(message, "stop_reason", None),
         )
 
     async def generate_structured(
@@ -327,16 +304,23 @@ class OpenAIProvider(BaseLLMProvider):
 
     provider_name = "openai"
 
-    def __init__(self, api_key: str, base_url: str | None = None):
+    def __init__(self, api_key: str, base_url: str | None = None, trust_env: bool = True,
+                 thinking_enabled: bool | None = None):
         try:
-            from openai import AsyncOpenAI
+            from openai import AsyncOpenAI, DefaultAsyncHttpxClient
         except ImportError:
             raise ImportError("openai package is required. Install with: pip install openai")
-        kwargs = {"api_key": api_key}
+        kwargs = {"api_key": api_key, "http_client": DefaultAsyncHttpxClient(trust_env=trust_env)}
         if base_url:
             kwargs["base_url"] = base_url
         self.client = AsyncOpenAI(**kwargs)
         self._base_url = base_url
+        self._thinking_enabled = thinking_enabled
+
+    def _thinking_options(self, model: str) -> dict:
+        if self._thinking_enabled is None or "deepseek" not in model.lower():
+            return {}
+        return {"extra_body": {"thinking": {"type": "enabled" if self._thinking_enabled else "disabled"}}}
 
     @property
     def _is_ollama(self) -> bool:
@@ -400,9 +384,12 @@ class OpenAIProvider(BaseLLMProvider):
         if use_json_mode:
             kwargs["response_format"] = {"type": "json_object"}
 
+        kwargs.update(self._thinking_options(model))
+
         response = await self.client.chat.completions.create(**kwargs)
 
         content = response.choices[0].message.content or ""
+        finish_reason = response.choices[0].finish_reason
         input_tokens = response.usage.prompt_tokens if response.usage else 0
         output_tokens = response.usage.completion_tokens if response.usage else 0
 
@@ -418,6 +405,7 @@ class OpenAIProvider(BaseLLMProvider):
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             cost=cost,
+            finish_reason=finish_reason,
         )
 
     async def generate_structured(
@@ -491,6 +479,8 @@ class OpenAIProvider(BaseLLMProvider):
             "max_tokens": max_tokens,
             "stream": True,
         }
+
+        kwargs.update(self._thinking_options(model))
 
         response = await self.client.chat.completions.create(**kwargs)
         async for chunk in response:

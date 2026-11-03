@@ -1,7 +1,8 @@
 """FastAPI application factory."""
 
+import asyncio
 import logging
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -21,8 +22,23 @@ async def lifespan(app: FastAPI):
     logger.info("Novel Agent starting...")
     settings = get_settings()
     settings.workspace_path.mkdir(parents=True, exist_ok=True)
-    yield
-    logger.info("Novel Agent shutting down...")
+    from .daily_rankings import get_daily_rankings
+    from .runtime import RuntimeLogHandler
+
+    handler = RuntimeLogHandler()
+    handler.setLevel(logging.INFO)
+    logging.getLogger().addHandler(handler)
+    cache = get_daily_rankings()
+    cache.schedule()
+    try:
+        yield
+    finally:
+        if cache.task and not cache.task.done():
+            cache.task.cancel()
+            with suppress(asyncio.CancelledError):
+                await cache.task
+        logging.getLogger().removeHandler(handler)
+        logger.info("Novel Agent shutting down...")
 
 
 def create_app() -> FastAPI:

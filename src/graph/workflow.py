@@ -88,6 +88,10 @@ def _has_scan_data(state: MainState) -> bool:
 
 def phase0_route(state: MainState) -> str:
     """Route into Phase 0 (commercial research) when scan data exists."""
+    if state.mini_arc_outline or state.bible:
+        return "skip"
+    if state.topic_research is not None:
+        return "topic"
     return "scan" if _has_scan_data(state) else "skip"
 
 
@@ -96,7 +100,8 @@ def bible_route(state: MainState) -> str:
 
 
 def characters_route(state: MainState) -> str:
-    return "skip" if state.characters else "work"
+    complete = not state.character_creation_progress or state.character_creation_progress.get("complete", False)
+    return "skip" if state.characters and state.characters.characters and complete else "work"
 
 
 def outline_route(state: MainState) -> str:
@@ -163,7 +168,7 @@ def _build_graph() -> StateGraph:
     builder.add_conditional_edges(
         "project_init",
         phase0_route,
-        {"scan": "platform_scan_work", "skip": "bible_route"},
+        {"scan": "platform_scan_work", "topic": "topic_selection_work", "skip": "bible_route"},
     )
     # Phase 0 chain (work → confirm → next)
     builder.add_edge("platform_scan_work", "platform_scan_confirm")

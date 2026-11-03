@@ -13,14 +13,27 @@
             <nav id="nav">
                 <a href="#workspace" class="nav-item active" data-view="workspace" id="nav-workspace">工作台</a>
                 <a href="#my-works" class="nav-item" data-view="my-works" id="nav-my-works">我的书库</a>
-                <a href="#assistant" class="nav-item" data-view="assistant" id="nav-assistant">智能写作助手</a>
+                <a href="#flow" class="nav-item" data-view="flow" id="nav-flow">智能体流程</a>
+                <a href="#reader" class="nav-item" data-view="reader" id="nav-reader">章节预览</a>
             </nav>
+            <section class="today-scan-panel" aria-labelledby="today-scan-heading">
+                <div class="today-scan-heading"><h3 id="today-scan-heading">今日扫榜</h3><span id="today-scan-date"></span></div>
+                <strong id="today-scan-status" role="status" aria-atomic="true">正在读取状态</strong>
+                <p id="today-scan-message">与创作任务独立运行</p>
+                <p id="today-scan-time"></p>
+                <p id="today-topic-status">今日选题：等待榜单</p>
+                <div class="today-scan-actions">
+                    <button onclick="App.showDailyRankings()">查看结果</button>
+                    <button id="today-scan-retry" onclick="App.refreshDailyRankings()">重试</button>
+                </div>
+            </section>
             <div class="sidebar-footer"><span id="api-status" class="status-dot offline">API</span></div>
         </aside>
 
         <main id="main-content">
             <!-- 工作台 = 创作流水线 -->
             <section id="view-workspace" class="view active">
+                <div class="workspace-layout">
                 <div id="workspace-pipeline">
                     <div class="workspace-toolbar" id="workspace-toolbar">
                         <div class="workspace-project-header" id="workspace-project-header" style="display:none">
@@ -28,11 +41,14 @@
                             <span class="project-title-display" id="project-title-display"></span>
                         </div>
                         <h2 id="workspace-default-title">创作流水线</h2>
+                        <button class="btn btn-secondary btn-sm" onclick="App.newWorkspace()">新建创作</button>
+                        <button class="btn btn-secondary btn-sm" onclick="App._navigate('reader')">预览已生成内容</button>
+                        <button class="btn btn-secondary btn-sm" id="btn-pause-task" onclick="App.pauseGeneration()" hidden>保存并暂停</button>
                     </div>
-                    <p class="welcome-subtitle">从选题到成书，AI 全程辅助你的创作之旅</p>
+                    <p class="welcome-subtitle">从你的灵感开始。今日榜单在后台准备，随时用来寻找方向。</p>
 
                     <!-- Step 1: Platform Scan -->
-                    <div class="pipeline-step" id="pipeline-step-scan" data-step="scan">
+                    <div class="pipeline-step" id="pipeline-step-scan" data-step="scan" hidden>
                         <div class="pipeline-node">
                             <div class="pipeline-icon">🔍</div>
                             <div class="pipeline-line"></div>
@@ -72,7 +88,36 @@
                                 <span class="pipeline-badge" id="badge-topic">待执行</span>
                             </div>
                             <div class="pipeline-card-body" id="body-topic">
-                                <p class="pipeline-desc">双榜交叉分析 → 对标书拆解 → 12 个候选题材 → 8 维评分 → 书名简介生成</p>
+                                <p class="pipeline-desc">输入想写的类型和故事灵感，研究候选方案；还没方向时，可以参考今日榜单。</p>
+                                <div class="topic-mode-bar">
+                                    <span id="topic-source-label">自主创作</span>
+                                    <button id="btn-return-manual" class="btn btn-secondary btn-sm" onclick="App.returnToManual()" hidden>返回自主创作</button>
+                                </div>
+                                <fieldset class="story-size" id="story-size"><legend>故事篇幅</legend><label for="size-preset">预设方案</label><select id="size-preset" onchange="App.applySizePreset()"><option value="10000:10">短篇 · 1万字 / 10章</option><option value="5000:5">微短篇 · 5000字 / 5章</option><option value="20000:20">中短篇 · 2万字 / 20章</option><option value="custom">自定义</option></select><div class="size-inputs"><label>总字数<input type="number" id="size-words" min="1000" max="500000" step="100" value="10000" oninput="App.updateSizeHint()"></label><label>总章节<input type="number" id="size-chapters" min="1" max="200" value="10" oninput="App.updateSizeHint()"></label></div><p id="size-hint" class="muted">平均每章约1000字；选题确认后按此预算规划。</p></fieldset>
+                                <div class="topic-entry" id="topic-entry">
+                                    <label for="topic-type">想写什么类型</label>
+                                    <input id="topic-type" maxlength="200" placeholder="例如：都市悬疑、女性成长、硬科幻">
+                                    <label for="topic-idea">故事灵感 <span class="field-optional">可选</span></label>
+                                    <textarea id="topic-idea" rows="3" maxlength="2000" placeholder="写下主角、冲突或你想探索的故事……"></textarea>
+                                    <div class="topic-entry-actions">
+                                        <button class="btn btn-primary" id="btn-research-topic" onclick="App.startTopicResearch('manual')">研究我的选题</button>
+                                        <button class="btn btn-secondary" onclick="App.showDailyRankings()">没有思路，看看今日榜单</button>
+                                    </div>
+                                    <p id="topic-entry-error" class="inline-error" role="alert"></p>
+                                </div>
+                                <details class="daily-rankings" id="daily-rankings">
+                                    <summary>今日榜单参考 <span id="rankings-date"></span></summary>
+                                    <p id="rankings-message">正在读取后台缓存状态……</p>
+                                    <div id="rankings-topics" class="ranking-topics"></div>
+                                    <div id="rankings-books"></div>
+                                    <section class="prepared-topics"><h4>今日预生成选题</h4><p id="prepared-topics-status" role="status">正在读取准备状态……</p><div id="prepared-topics-cards"></div><button class="btn btn-secondary btn-sm" id="retry-prepared-topics" onclick="App.retryPreparedTopics()">重试未完成选题</button></section>
+                                    <div class="topic-entry-actions">
+                                        <button class="btn btn-primary btn-sm" id="btn-use-rankings" onclick="App.startTopicResearch('rankings')" disabled>使用今日预生成选题</button>
+                                        <button class="btn btn-secondary btn-sm" onclick="App.returnToManual()">不用榜单，自主创作</button>
+                                        <button class="btn btn-secondary btn-sm" id="btn-refresh-rankings" onclick="App.refreshDailyRankings()">重试今日扫榜</button>
+                                    </div>
+                                    <p class="ranking-footnote">每天按北京时间更新；同一天所有项目共享结果。失败不影响手动选题。</p>
+                                </details>
                                 <!-- Candidate topic checkboxes -->
                                 <div id="topic-candidates-area" style="display:none">
                                     <p style="font-weight:600;font-size:0.82rem;margin-bottom:6px">☑ 候选题材（勾选后点击生成简介）</p>
@@ -96,7 +141,7 @@
                                 <!-- Confirm bar -->
                                 <div id="topic-confirm-area" style="display:none" class="confirm-bar">
                                     <textarea id="topic-inspiration" placeholder="补充灵感或想法（可选）..." rows="2"></textarea>
-                                    <button class="btn btn-success" onclick="App.confirmTopic()">确认选题，创建项目 →</button>
+                                    <button class="btn btn-success" onclick="App.confirmTopic()">确认选题，生成小事件大纲 →</button>
                                 </div>
                             </div>
                         </div>
@@ -114,7 +159,7 @@
                                 <span class="pipeline-badge" id="badge-arc">待执行</span>
                             </div>
                             <div class="pipeline-card-body" id="body-arc">
-                                <p class="pipeline-desc">为选定题材生成 10 章小事件闭环大纲，每章 2000 字，确保开篇即爆</p>
+                                <p class="pipeline-desc">按所选总字数与章节数规划精简事件骨架，确定开篇、发展与结局。</p>
                                 <div id="arc-result-area" style="display:none"></div>
                                 <div id="arc-confirm-area" style="display:none" class="confirm-bar">
                                     <textarea id="arc-inspiration" placeholder="补充灵感或修改意见（可选）..." rows="2"></textarea>
@@ -207,13 +252,57 @@
                         </div>
                     </div>
                 </div>
+                <aside class="runtime-panel" aria-labelledby="runtime-heading">
+                    <div class="runtime-heading"><h3 id="runtime-heading">后台状态</h3><span id="runtime-connection" class="runtime-pill">连接中</span></div>
+                    <div class="runtime-summary" role="status" aria-atomic="true">
+                        <span class="runtime-eyebrow">当前创作任务</span>
+                        <strong id="runtime-stage">就绪</strong>
+                        <p id="runtime-message">输入选题，开始新的创作。</p>
+                    </div>
+                    <dl class="runtime-facts">
+                        <div><dt>阶段用时</dt><dd id="runtime-elapsed">—</dd></div>
+                        <div><dt>最近心跳</dt><dd id="runtime-updated">—</dd></div>
+                        <div><dt>今日榜单</dt><dd id="runtime-rankings">准备中</dd></div>
+                    </dl>
+                    <p id="runtime-warning" class="runtime-warning" hidden></p>
+                    <button class="btn btn-primary" id="btn-retry-task" onclick="App.resumeGeneration()" hidden>继续上次生成</button>
+                    <details id="runtime-log-details" class="runtime-log-details" open>
+                    <summary class="runtime-log-heading">运行记录 <span>自动更新</span></summary>
+                    <ol id="runtime-events" class="runtime-events" aria-label="后台运行记录"><li>等待后台状态……</li></ol>
+                    </details>
+                    <p class="runtime-note">已完成步骤自动保存。退出前可点击“保存并暂停”，重新打开后继续；尚未返回的模型请求会从当前小步骤重试。</p>
+                </aside>
+                </div>
             </section>
 
             <!-- 我的书库 = 项目列表 -->
             <section id="view-my-works" class="view">
-                <h2>我的书库</h2>
+                <div class="library-header"><div><p class="eyebrow">创作档案</p><h2>我的书库</h2><p class="muted">成果、进度和运行记录都保存在这里，选择一本继续创作。</p></div><button class="btn btn-primary" onclick="App.newWorkspace()">新建创作</button></div>
+                <div id="library-notice" class="library-notice" role="status" hidden></div>
                 <div id="my-works-cards" class="card-grid"><p class="empty-state">暂无项目，前往<a href="#workspace">工作台</a>开始创作</p></div>
             </section>
+
+            <section id="view-reader" class="view">
+                <div class="library-header"><div><p class="eyebrow">边写边读</p><h2>章节预览</h2><p class="muted">初稿保存后即可阅读，无需等全书完成。每 3 秒同步已保存内容。</p></div><button class="btn btn-secondary" onclick="App._navigate('workspace')">返回创作</button></div>
+                <div class="flow-project-bar"><label for="reader-project">当前项目</label><select id="reader-project" onchange="App.selectReaderProject(this.value)"></select><button class="btn btn-secondary" onclick="App.refreshReader()">刷新内容</button></div>
+                <p id="reader-error" class="field-error" role="alert"></p>
+                <div class="reader-layout"><aside class="reader-chapters"><h3>章节目录</h3><div id="reader-chapters"><p class="muted">选择项目查看章节</p></div></aside><article class="reader-paper"><div class="reader-toolbar"><span id="reader-version-label" class="runtime-pill">等待内容</span><label for="reader-version">阅读版本</label><select id="reader-version" onchange="ChapterReader.changeVersion(this.value,App)"></select></div><h2 id="reader-title">选择一个章节</h2><p id="reader-note" class="reader-note"></p><div id="reader-content" class="reader-prose">章节生成后会出现在这里。</div></article></div>
+            </section>
+
+            <section id="view-flow" class="view">
+                <div class="library-header"><div><p class="eyebrow">多智能体协作</p><h2>智能体流程</h2><p class="muted">沿着协作关系查看执行过程，点击智能体检查指令、输入和输出。</p></div><button class="btn btn-secondary" onclick="App._navigate('workspace')">返回创作</button></div>
+                <div class="flow-project-bar"><label for="flow-project-select">当前项目</label><select id="flow-project-select" onchange="App.selectFlowProject(this.value)"><option value="">请选择项目</option></select><button class="btn btn-primary" id="flow-resume" onclick="App.continueBook(App.currentProjectId)">继续创作</button><button class="btn btn-secondary" id="flow-pause" onclick="App.pauseGeneration()">保存并暂停</button></div>
+                <div class="agent-flow-layout">
+                    <div class="flow-main"><div class="flow-overview"><span class="runtime-pill" id="flow-connection">连接中</span><strong id="flow-status" role="status" aria-atomic="true">尚未选择项目</strong><p id="flow-message">从书库选择一个项目，即可查看已保存的进度。</p><p class="muted" id="flow-updated"></p></div>
+                        <section class="flow-map-panel" aria-label="智能体协作关系图"><div class="flow-map-heading"><div><p class="eyebrow">从灵感到成稿</p><h3>协作关系图 <span class="flow-agent-count">12 个智能体</span></h3></div><span class="flow-map-hint">点击节点，查看工作详情 ↗</span></div><div class="flow-legend"><span><i class="legend-line" aria-hidden="true"></i>工作交接</span><span><i class="legend-line dashed" aria-hidden="true"></i>调度 / 回退 / 记忆反馈</span><span><i class="legend-dot" aria-hidden="true"></i>正在工作</span></div><div class="flow-map-scroll" tabindex="0" aria-label="关系图，可横向滚动"><div id="agent-graph" class="agent-graph"></div></div><p class="muted">高亮表示真实模型调用；调用完成不代表整个阶段已通过审核。准备阶段之间需要人工确认。</p></section>
+                    </div>
+                    <aside id="flow-inspector" class="flow-inspector" aria-label="智能体详情" hidden onkeydown="if(event.key === 'Escape') AgentFlow.closeInspector(App)"><div class="flow-inspector-header"><p class="eyebrow">工作详情</p><button type="button" class="btn btn-secondary btn-sm" id="flow-inspector-close" onclick="AgentFlow.closeInspector(App)" aria-label="收起工作详情">收起 <span aria-hidden="true">→</span></button></div><div id="agent-detail"></div></aside>
+                </div>
+                <details class="flow-console flow-log-panel"><summary>后端运行记录（每 3 秒更新）</summary><p class="muted">当前项目记录，最新事件在前。暂停刷新只影响显示。</p><div class="console-controls"><label><input id="flow-errors-only" type="checkbox" onchange="App.renderFlow()"> 仅看警告和错误</label><button class="btn btn-secondary btn-sm" id="flow-freeze" onclick="App.toggleFlowRefresh()">暂停刷新</button></div><ol id="flow-events" class="runtime-events flow-events" aria-label="项目运行记录"></ol></details>
+            </section>
+
+            <dialog id="book-title-dialog" class="book-dialog"><form id="book-title-form" onsubmit="event.preventDefault(); App.saveBookTitle()"><h2>编辑书名</h2><label for="book-title-input">书名</label><input id="book-title-input" maxlength="100" required><p class="muted">修改书名会保留已有内容和生成进度。</p><p id="book-title-error" class="field-error" role="alert"></p><div class="dialog-actions"><button type="button" class="btn btn-secondary" onclick="document.getElementById('book-title-dialog').close()">取消</button><button type="submit" class="btn btn-primary" id="book-title-save">保存</button></div></form></dialog>
+            <dialog id="book-delete-dialog" class="book-dialog"><h2>删除创作记录</h2><p id="book-delete-name"></p><p class="muted">正在生成的任务会停止，记录移入本地回收目录。删除后可以撤销。</p><p id="book-delete-error" class="field-error" role="alert"></p><div class="dialog-actions"><button class="btn btn-secondary" onclick="document.getElementById('book-delete-dialog').close()">取消</button><button class="btn btn-danger" id="book-delete-confirm" onclick="App.confirmDeleteBook()">删除记录</button></div></dialog>
 
             <!-- 项目详情 = 独立页面 -->
             <section id="view-project" class="view">
@@ -237,44 +326,14 @@
                 <div id="chapter-modal" class="modal"><div class="modal-content"><span class="modal-close">&times;</span><div id="chapter-modal-body"></div></div></div>
             </section>
 
-            <!-- 智能写作助手 -->
-            <section id="view-assistant" class="view">
-                <div class="assistant-layout">
-                    <div class="chat-main">
-                        <div class="chat-messages" id="chat-messages">
-                            <div class="chat-welcome">
-                                <h2>智能小说写作助手</h2>
-                                <p>我可以帮你：</p>
-                                <div class="assistant-suggestions">
-                                    <button onclick="App.quickChat('帮我分析这段文字的优点和不足')">分析文字</button>
-                                    <button onclick="App.quickChat('帮我润色下面这段小说')">润色文字</button>
-                                    <button onclick="App.quickChat('帮我基于这个创意写一段开头')">创意写作</button>
-                                    <button onclick="App.quickChat('给我一些关于人物塑造的建议')">写作建议</button>
-                                </div>
-                            </div>
-                        </div>
-                        <div class="chat-input-area">
-                            <div class="chat-toolbar">
-                                <button class="btn btn-secondary btn-sm" onclick="document.getElementById('assistant-file-input').click()">上传文件</button>
-                                <input type="file" id="assistant-file-input" accept=".txt,.md" style="display:none" onchange="App.handleAssistantFile(event)">
-                                <span id="assistant-file-name" class="file-name"></span>
-                                <select id="chat-mode" class="chat-mode-select">
-                                    <option value="chat">自由对话</option><option value="analyze">分析文本</option><option value="polish">润色改写</option><option value="rewrite">创意改写</option>
-                                </select>
-                            </div>
-                            <div class="chat-input-row">
-                                <textarea id="chat-input" placeholder="输入消息，或粘贴需要处理的文本..." rows="2"></textarea>
-                                <button class="btn btn-primary" onclick="App.sendAssistantMessage()">发送</button>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-            </section>
         </main>
     </div>
 
-    <script src="/static/js/api.js?v=22"></script>
-    <script src="/static/js/components.js?v=22"></script>
-    <script src="/static/js/app.js?v=22"></script>
+    <script src="/static/js/api.js?v=28"></script>
+    <script src="/static/js/components.js?v=28"></script>
+    <script src="/static/js/workspace-state.js?v=28"></script>
+    <script src="/static/js/agent-flow.js?v=28"></script>
+    <script src="/static/js/chapter-reader.js?v=28"></script>
+    <script src="/static/js/app.js?v=28"></script>
 </body>
 </html>

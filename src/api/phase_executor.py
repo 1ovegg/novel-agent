@@ -185,6 +185,8 @@ async def execute_phase_topic_selection(
     scoring → title/synopsis generation.
     """
     state = await orchestrator.select_topic(state)
+    if fm and state.topic_research:
+        fm.save_topic_research(state.topic_research)
     return state
 
 
@@ -266,6 +268,8 @@ def get_phase_data(state: MainState, phase: str) -> dict:
     elif phase == "character_creation" and state.characters:
         return {
             "characters": {cid: c.model_dump() for cid, c in state.characters.characters.items()},
+            "creation_progress": state.character_creation_progress,
+            "complete": not state.character_creation_progress or state.character_creation_progress.get("complete", False),
         }
     elif phase == "master_outline" and state.outline:
         d = state.outline.model_dump()

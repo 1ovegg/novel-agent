@@ -80,9 +80,9 @@ AGENT_CONFIGS: dict[str, dict] = {
     "topic_scout": {"temperature": 0.5, "max_tokens": 8192, "tier": "quality"},
     # Analytical agents — lower temperature for consistency
     "editor": {"temperature": 0.3, "max_tokens": 4096, "tier": "budget"},
-    "continuity_checker": {"temperature": 0.3, "max_tokens": 4096, "tier": "budget"},
-    "reader_simulator": {"temperature": 0.5, "max_tokens": 2048, "tier": "budget"},
-    "memory_manager": {"temperature": 0.3, "max_tokens": 4096, "tier": "budget"},
+    "continuity_checker": {"temperature": 0.3, "max_tokens": 8192, "tier": "budget"},
+    "reader_simulator": {"temperature": 0.5, "max_tokens": 8192, "tier": "budget"},
+    "memory_manager": {"temperature": 0.3, "max_tokens": 8192, "tier": "budget"},
     "refiner": {"temperature": 0.4, "max_tokens": 8192, "tier": "budget"},
     # Orchestrator
     "orchestrator": {"temperature": 0.3, "max_tokens": 2048, "tier": "budget"},

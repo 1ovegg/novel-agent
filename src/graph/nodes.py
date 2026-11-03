@@ -50,17 +50,20 @@ def _ws(config: RunnableConfig | None):
 
 
 def get_chapter_phase(fm, ch: int) -> int:
-    """Get the completion phase of a chapter (0-5), persisted to disk."""
+    """Verify phase markers against artifacts so stale markers cannot skip a chapter."""
     phase_file = os.path.join(fm.root, "output", "chapters", f"chapter_{ch:03d}_phase.json")
+    saved_phase = None
     try:
         if os.path.exists(phase_file):
             with open(phase_file) as f:
-                return json.load(f).get("phase", 0)
+                saved_phase = json.load(f).get("phase", 0)
     except Exception:
         pass
-    # Fallback: detect from existing artifacts
     if fm.load_chapter_markdown(ch):
-        return 4  # Has polished content
+        return 5 if saved_phase == 5 else 4
+    # A saved raw draft can still be waiting for fact extraction.
+    if saved_phase == 1 and fm.load_chapter_plan(ch):
+        return 1
     if getattr(fm, "load_review_report", None) and fm.load_review_report(ch):
         return 3
     if getattr(fm, "load_chapter_draft", None) and fm.load_chapter_draft(ch):
@@ -84,12 +87,16 @@ def apply_inspiration(state: MainState, resume: Any) -> MainState:
         inspiration = resume.get("inspiration")
         if inspiration:
             state.current_inspiration = inspiration
+        selected = resume.get("selected_topic")
+        if selected and state.topic_research:
+            from ..models.topic import TitleSynopsisReport
+            state.topic_research.title_synopsis = [TitleSynopsisReport.model_validate(selected)]
     return state
 
 
 def chapter_progress_increment(state: MainState) -> float:
     """Per-chapter progress increment, mirroring the original 5%→90% scheme."""
-    total = max((state.outline.chapter_count if state.outline else 0), state.total_chapters, 3)
+    total = state.project_config.target_chapter_count if state.project_config and state.project_config.target_chapter_count else max((state.outline.chapter_count if state.outline else 0), state.total_chapters, 3)
     return 85.0 / max(total, 1)
 
 
@@ -111,6 +118,7 @@ async def _run_phase(state: MainState, config: dict, phase: str, executor_fn) ->
     ws = _ws(config)
 
     from ..api.phase_executor import PHASE_LABELS, get_phase_data
+    from ..api.runtime import execution_context, project_context, runtime_status
 
     label = PHASE_LABELS.get(phase, phase)
     heartbeat_stop = asyncio.Event()
@@ -120,7 +128,7 @@ async def _run_phase(state: MainState, config: dict, phase: str, executor_fn) ->
         while not heartbeat_stop.is_set():
             dots = (dots + 1) % 4
             await ws.broadcast_phase_update(
-                project_id, phase, 0.15 + (dots * 0.02), f"正在{label}{'.' * dots}"
+                project_id, phase, 0.15 + (dots * 0.02), f"正在{label}"
             )
             try:
                 await asyncio.wait_for(heartbeat_stop.wait(), timeout=3)
@@ -130,13 +138,61 @@ async def _run_phase(state: MainState, config: dict, phase: str, executor_fn) ->
     heartbeat_task = asyncio.create_task(_heartbeat())
     await ws.broadcast_phase_update(project_id, phase, 0.1, f"正在{label}...")
 
+    context_token = project_context.set(project_id)
+    if fm:
+        runtime_status.bind_project(project_id, fm)
+    execution_token = execution_context.set({"phase": phase, "chapter": state.current_chapter_number + 1 if phase in ("chapter_planning", "chapter_writing", "quality_review", "polish_revision", "memory_update") else None})
+    if phase in ("topic_selection", "mini_arc_outline"):
+        async def topic_checkpoint(partial, message):
+            if fm:
+                if partial.topic_research:
+                    fm.save_topic_research(partial.topic_research)
+                fm.save_workflow_state(partial,"running",phase)
+            await ws.broadcast_agent_message(project_id,"topic_scout",message)
+        orchestrator.topic_checkpoint = topic_checkpoint
+    if phase == "character_creation":
+        async def character_checkpoint(partial, message):
+            if fm:
+                fm.save_characters(partial.characters)
+                fm.save_workflow_state(partial, "running", phase)
+            await ws.broadcast_agent_message(project_id, "character_manager", message)
+        orchestrator.character_checkpoint = character_checkpoint
+    if phase == "polish_revision":
+        async def polish_checkpoint(partial, message):
+            if fm:
+                fm.save_workflow_state(partial, "running", phase)
+            await ws.broadcast_agent_message(project_id, "refiner", message)
+        orchestrator.polish_checkpoint = polish_checkpoint
+    if phase == "chapter_writing":
+        async def writer_checkpoint(partial, message):
+            if fm:
+                if partial.chapter_draft:
+                    fm.save_chapter_draft(partial.chapter_draft)
+                fm.save_workflow_state(partial, "running", phase)
+            await ws.broadcast_agent_message(project_id, "writer", message)
+        orchestrator.writer_checkpoint = writer_checkpoint
+    if fm:
+        fm.save_workflow_state(state, "running", phase)
     try:
         updated = await executor_fn(state, orchestrator, fm)
+    except asyncio.CancelledError:
+        if fm:
+            fm.save_workflow_state(state, "interrupted", phase)
+        raise
+    except Exception as exc:
+        state.add_error(f"{phase}: {exc}")
+        if fm:
+            fm.save_workflow_state(state, "failed", phase, error=str(exc))
+        raise
     finally:
+        project_context.reset(context_token)
+        execution_context.reset(execution_token)
         heartbeat_stop.set()
         heartbeat_task.cancel()
 
-    phase_data = get_phase_data(state, phase)
+    if fm:
+        fm.save_workflow_state(updated, "running", phase)
+    phase_data = get_phase_data(updated, phase)
     await ws.broadcast_phase_update(project_id, phase, 1.0, f"{label}完成")
     await ws.broadcast_phase_complete(project_id, phase, phase_data)
     return updated
@@ -251,6 +307,8 @@ async def chapter_plan_node(state: MainState, config: RunnableConfig | None = No
     if phase < 1 or state.review_iteration > 0:
         from ..api.phase_executor import execute_phase_chapter_planning
 
+        orchestrator = cfg.get("orchestrator")
+        orchestrator.chapter_followup_context = fm.load_chapter_markdown(ch + 1) if fm else None
         state = await _run_phase(state, config, "chapter_planning", execute_phase_chapter_planning)
         if state.chapter_plan:
             fm.save_chapter_plan(state.chapter_plan)
@@ -273,15 +331,21 @@ async def chapter_write_node(state: MainState, config: RunnableConfig | None = N
 
     if phase < 2 or state.review_iteration > 0:
         project_id = cfg.get("project_id")
-        orchestrator = cfg.get("orchestrator")
         base_progress = 5 + (state.current_chapter_number * chapter_progress_increment(state))
         await ws.broadcast_phase_update(
             project_id, "chapter_writing", (base_progress + 4) / 100, f"正在写作第{ch}章..."
         )
-        state = await orchestrator.write_chapter(state)
+        from ..api.phase_executor import execute_phase_chapter_writing
+
+        async def execute(state, orchestrator, fm):
+            return await execute_phase_chapter_writing(state, orchestrator, fm, ws, project_id)
+
+        state = await _run_phase(state, config, "chapter_writing", execute)
         if state.chapter_draft:
             fm.save_chapter_draft(state.chapter_draft)
         set_chapter_phase(fm, ch, 2)
+    elif state.chapter_draft is None or state.chapter_draft.chapter_number != ch:
+        state.chapter_draft = fm.load_chapter_draft(ch)
     return state.model_dump()
 
 
@@ -304,6 +368,8 @@ async def chapter_review_node(state: MainState, config: RunnableConfig | None = 
             fm.save_review_report(state.review_report)
             await ws.broadcast_chapter_complete(project_id, ch, state.review_report.dimension_scores)
         set_chapter_phase(fm, ch, 3)
+    elif state.review_report is None or state.review_report.chapter_number != ch:
+        state.review_report = fm.load_review_report(ch)
     return state.model_dump()
 
 
@@ -375,6 +441,9 @@ async def chapter_advance_node(state: MainState, config: RunnableConfig | None =
     base_progress = 5 + (state.current_chapter_number * chapter_progress_increment(state))
 
     state.advance_chapter()
+    fm = cfg.get("fm")
+    if fm:
+        fm.save_workflow_state(state, "running", "chapter_planning")
     await ws.broadcast_phase_update(
         project_id, "chapter_loop", (base_progress + 16) / 100, f"第{ch}章完成 ✓"
     )

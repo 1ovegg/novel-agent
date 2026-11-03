@@ -179,6 +179,7 @@ class MemoryManagerAgent(BaseAgent):
             prev_foreshadowing=prev_foreshadowing or "无",
         )
 
+        user += "\n\n请精简输出：摘要不超过300字，时间线最多4条、伏笔更新最多5条、未解决问题最多4条，每条描述不超过60字。不要复述原文。"
         result = await self.generate_structured(
             system_prompt=system,
             user_prompt=user,

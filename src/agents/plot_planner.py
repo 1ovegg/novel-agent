@@ -289,8 +289,8 @@ class PlotPlannerAgent(BaseAgent):
         theme_lines = ", ".join(t.name for t in themes)
 
         # Estimate chapter count
-        avg_words_per_chapter = 4000
-        total_chapters = max(10, config.target_word_count // avg_words_per_chapter)
+        total_chapters = config.target_chapter_count or max(10, config.target_word_count // 4000)
+        avg_words_per_chapter = config.chapter_word_target(1)
 
         user = f"""请为以下小说设计完整的故事结构：
 
@@ -314,15 +314,15 @@ class PlotPlannerAgent(BaseAgent):
 - 一句话简介（logline）
 
 ### 2. 主线剧情（main_plot）
-- 分配 3-5 个主要剧情弧线（arc）
+- 分配 {'1-2' if config.target_chapter_count and total_chapters <= 20 else '3-5'} 个主要剧情弧线（arc）
 - 每个弧线包含：起止章、关键节拍（beats）
 
 ### 3. 支线剧情（subplots）
-- 2-3 条支线
+- {'0-1' if config.target_chapter_count and total_chapters <= 20 else '2-3'} 条支线
 - 每条标注类型（subplot / b_plot）
 
 ### 4. 分卷结构（volumes）
-- 将故事分为 {max(2, total_chapters // 30)} - {max(3, total_chapters // 20)} 卷
+- 将故事分为 {'1' if config.target_chapter_count and total_chapters <= 20 else str(max(2,total_chapters//30)) + '-' + str(max(3,total_chapters//20))} 卷
 - 每卷：标题、简介、起止章节、主要事件、情感弧线
 
 ### 5. 关键转折点（major_turning_points）
@@ -340,6 +340,8 @@ class PlotPlannerAgent(BaseAgent):
 - 主线与支线有机交织
 - 为角色弧线留出展示空间"""
 
+        if config.target_chapter_count:
+            user += f"\n篇幅硬约束：全书恰好{total_chapters}章，合计约{config.target_word_count}字；所有卷和转折点的章节号必须在1至{total_chapters}内。短篇以一条主线为主，不要扩成长篇。"
         result = await self.generate_structured(
             system_prompt=system,
             user_prompt=user,
@@ -356,8 +358,14 @@ class PlotPlannerAgent(BaseAgent):
             subplots=result.subplots,
             volumes=result.volumes,
             major_turning_points=result.major_turning_points,
-            chapter_count=result.chapter_count or total_chapters,
+            chapter_count=config.target_chapter_count or result.chapter_count or total_chapters,
         )
+        if config.target_chapter_count:
+            for volume in outline.volumes:
+                volume.start_chapter = min(max(volume.start_chapter, 1), total_chapters)
+                volume.end_chapter = min(max(volume.end_chapter, volume.start_chapter), total_chapters)
+            for point in outline.major_turning_points:
+                point.chapter = min(max(point.chapter, 1), total_chapters)
 
         logger.info(
             f"Master outline created: {outline.title}, {len(outline.volumes)} volumes, {outline.chapter_count} chapters"
@@ -376,6 +384,7 @@ class PlotPlannerAgent(BaseAgent):
         characters: CharacterRegistry,
         outline: MasterOutline,
         memory: MemoryState | None = None,
+        continuity_context: str = "",
     ) -> ChapterPlan:
         """Plan a single chapter in detail."""
         logger.info(f"Planning chapter {chapter_number}...")
@@ -402,6 +411,9 @@ class PlotPlannerAgent(BaseAgent):
         tps_text = str([(tp.turning_type, tp.description) for tp in chapter_tps]) if chapter_tps else "无特定转折点"
         char_states_text = self._format_character_states(characters, memory)
         length_range = f"{bible.rules.chapter_length_range[0]}-{bible.rules.chapter_length_range[1]}"
+        if config.target_chapter_count:
+            target = config.chapter_word_target(chapter_number)
+            length_range = f"{int(target*.9)}-{int(target*1.1)}"
 
         system_default = self.build_system_prompt(
             role="章节规划师",
@@ -458,6 +470,11 @@ class PlotPlannerAgent(BaseAgent):
             tone=config.tone,
         )
 
+        if continuity_context:
+            user += "\n\n【已有后续章节的衔接约束】\n" + continuity_context
+        if config.target_chapter_count:
+            target = config.chapter_word_target(chapter_number)
+            user += f"\n篇幅硬约束：本章约{target}字，全书{config.target_chapter_count}章；按篇幅安排少量场景，场景字数合计不得突破本章预算。" + ("建议1至3个短场景。" if target <= 1500 else "")
         result = await self.generate_structured(
             system_prompt=system,
             user_prompt=user,
@@ -479,7 +496,7 @@ class PlotPlannerAgent(BaseAgent):
             foreshadowing=result.foreshadowing,
             emotional_curve=result.emotional_curve,
             ending_hook=result.ending_hook,
-            word_count_target=result.word_count_target or 4000,
+            word_count_target=config.chapter_word_target(chapter_number) if config.target_chapter_count else result.word_count_target or 4000,
             status="planned",
         )
 
